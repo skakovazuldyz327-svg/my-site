@@ -1,0 +1,4 @@
+@echo off
+set "SITE_DIR=%~dp0"
+powershell -NoProfile -Command "$all = @(Get-CimInstance Win32_Process); $caller = ($all | Where-Object { $_.ProcessId -eq $PID }).ParentProcessId; $siteNode = $env:SITE_DIR + '.tools\node\node.exe'; $marks = @(($env:SITE_DIR + 'server\index.js'), ($env:SITE_DIR + 'start-site.bat')); $found = @($all | Where-Object { $p = $_; $p.ProcessId -ne $caller -and (($p.Name -eq 'node.exe' -and $p.ExecutablePath -and $p.ExecutablePath -ieq $siteNode -and $p.CommandLine -match 'server[\\/]index\.js') -or ($p.Name -in 'node.exe', 'powershell.exe', 'cmd.exe' -and $p.CommandLine -and @($marks | Where-Object { $p.CommandLine.IndexOf($_, [StringComparison]::OrdinalIgnoreCase) -ge 0 }).Count)) }); foreach ($p in $found) { Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue }; if ($found.Count) { Start-Sleep -Seconds 1; '  Site stopped.' } else { '  Site was not running.' }"
+if not "%~1"=="nopause" timeout /t 3 >nul

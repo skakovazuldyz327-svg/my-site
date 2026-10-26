@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="robots" content="noindex" />
+  <title>Админка — Жулдыз</title>
+  <link rel="icon" href="/favicon.ico" sizes="any" />
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+  <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,560&family=Sora:wght@400;500;600&display=swap" rel="stylesheet" />
+</head>
+<body class="admin">
+  <div id="root">
+    <main class="admin-main">
+      <section class="panel" id="offline" hidden>
+        <h1>Админка не запущена</h1>
+        <p>Откройте папку сайта и дважды нажмите на файл <strong>start-site.bat</strong>, затем перейдите по адресу <strong>http://127.0.0.1:8765/admin.html</strong>.</p>
+      </section>
+    </main>
+  </div>
+  <script>
+    if (location.protocol === "file:") document.getElementById("offline").hidden = false;
+  </script>
+  <script type="module" src="/src/entries/admin.jsx"></script>
+</body>
+</html>
