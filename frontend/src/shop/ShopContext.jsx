@@ -1,10 +1,11 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useState } from "react";
 import ErrorBoundary from "../components/ErrorBoundary.jsx";
-import { settings } from "../lib/catalog.js";
+import { catalogFailedNote, catalogLoaded, products, settings } from "../lib/catalog.js";
 import { addLine, BAG_KEY, checkBag, droppedNote, fullBagNote, loadBag, retryPendingOrders, saveBag } from "../lib/order.js";
 import { companyDetails } from "../pdf/company.js";
 import BagDialog from "./BagDialog.jsx";
 import CheckoutDialog from "./CheckoutDialog.jsx";
+import DialogCrashed from "./DialogCrashed.jsx";
 import OrderDialog from "./OrderDialog.jsx";
 import SentDialog from "./SentDialog.jsx";
 
@@ -17,8 +18,11 @@ const PENDING_RETRY_MS = 60 * 1000;
 export const useShop = () => useContext(ShopContext);
 
 // Lines the admin removed meanwhile leave the saved bag at once, so the note about them is shown only once.
+// Without the real catalog every saved line looks removed, so the saved bag is neither checked nor written until it loads.
+// An empty catalog that drops lines is taken for a failed load too: the admin emptying the whole shop is far less likely.
 function openingBag() {
   const { bag, dropped } = checkBag();
+  if (!catalogLoaded || (dropped.length && !products.length)) return { bag: [], note: catalogFailedNote, missing: true };
   if (!dropped.length) return { bag, note: "" };
   saveBag(bag);
   return { bag, note: droppedNote(dropped) };
@@ -26,6 +30,7 @@ function openingBag() {
 
 export function ShopProvider({ children }) {
   const [opening] = useState(openingBag);
+  const catalogMissing = Boolean(opening.missing);
   const [bag, setBagState] = useState(opening.bag);
   // Shown at the top of the bag until the buyer leaves it.
   const [note, setNote] = useState(opening.note);
@@ -52,15 +57,19 @@ export function ShopProvider({ children }) {
   }, []);
 
   const setBag = useCallback((next) => {
-    saveBag(next);
+    if (!catalogMissing) saveBag(next);
     setBagState(next);
-  }, []);
+  }, [catalogMissing]);
 
   const addToBag = useCallback((line) => {
+    if (catalogMissing) {
+      setNote(catalogFailedNote);
+      return;
+    }
     const next = addLine(loadBag(), line);
     if (next) setBag(next);
     else setNote(fullBagNote);
-  }, [setBag]);
+  }, [setBag, catalogMissing]);
 
   const openOrder = useCallback((product, size = "", qty = 1) => {
     setOrder({ product, size, qty, key: Date.now() });
@@ -85,27 +94,35 @@ export function ShopProvider({ children }) {
 
   // saved: the promise sendOrder returned. Shown over the page the buyer comes back to from WhatsApp.
   const [sent, setSent] = useState(null);
+  // Without invoices the window appears only when the site could not save the order, and never over a window opened meanwhile.
   const showSent = useCallback((saved) => {
-    if (!INVOICE_OFFERED) return;
-    setSent({ saved, key: Date.now() });
-    setDialog("sent");
+    const show = () => {
+      setSent({ saved, key: Date.now() });
+      setDialog((current) => (INVOICE_OFFERED ? "sent" : current ?? "sent"));
+    };
+    if (INVOICE_OFFERED) show();
+    else saved.then(({ state }) => (state === "queued" || state === "rejected") && show());
   }, []);
 
-  const value = useMemo(() => ({ bag, setBag, addToBag, openOrder, openBag, note }), [bag, setBag, addToBag, openOrder, openBag, note]);
+  const value = useMemo(
+    () => ({ bag, setBag, addToBag, openOrder, openBag, note, catalogMissing }),
+    [bag, setBag, addToBag, openOrder, openBag, note, catalogMissing]
+  );
 
   return (
     <ShopContext.Provider value={value}>
+      {catalogMissing && <p className="catalog-alert" role="alert">{catalogFailedNote}</p>}
       {children}
-      <ErrorBoundary resetKey={order?.key}>
+      <ErrorBoundary resetKey={order?.key} fallback={<DialogCrashed id="order" open={dialog === "order"} onClose={close} />}>
         <OrderDialog open={dialog === "order"} order={order} onClose={close} onAdded={openBag} onSent={showSent} />
       </ErrorBoundary>
-      <ErrorBoundary>
+      <ErrorBoundary resetKey={dialog} fallback={<DialogCrashed id="bag" open={dialog === "bag"} onClose={closeBag} />}>
         <BagDialog open={dialog === "bag"} onClose={closeBag} onCheckout={checkout} />
       </ErrorBoundary>
-      <ErrorBoundary>
+      <ErrorBoundary resetKey={dialog} fallback={<DialogCrashed id="checkout" open={dialog === "checkout"} onClose={close} />}>
         <CheckoutDialog open={dialog === "checkout"} onClose={close} onBag={backToBag} onSent={showSent} />
       </ErrorBoundary>
-      <ErrorBoundary resetKey={sent?.key}>
+      <ErrorBoundary resetKey={sent?.key} fallback={<DialogCrashed id="sent" open={dialog === "sent"} onClose={close} />}>
         <SentDialog open={dialog === "sent"} sent={sent} onClose={close} />
       </ErrorBoundary>
     </ShopContext.Provider>

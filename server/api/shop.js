@@ -32,7 +32,7 @@ export function registerShopApi(router, { config, store, logger }) {
     }
     const number = await store.orders.add(await readJson(req, 50 * KB));
     if (!number) {
-      sendJson(res, 400, { ok: false });
+      sendJson(res, 400, { ok: false, error: "refused" });
       return;
     }
     // The order as saved goes back to the visitor for the invoice; an order kept in the rescue file has none yet.

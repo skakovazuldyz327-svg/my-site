@@ -1,25 +1,26 @@
 import { useCallback, useState } from "react";
 import ProductGrid from "../components/ProductGrid.jsx";
 import ShopHelp from "../components/ShopHelp.jsx";
-import { products, whatsapp } from "../lib/catalog.js";
+import { catalogLoaded, products, whatsapp } from "../lib/catalog.js";
 import { downloadCatalogPdf } from "../pdf/index.js";
 
 const categories = [...new Set(products.map((product) => product.category).filter(Boolean))];
 const filters = [["Все", ""], ...categories.map((category) => [category, category])];
 
 function CatalogPdfButton({ category }) {
-  const [state, setState] = useState({ busy: false, label: "", failed: false });
+  const [state, setState] = useState({ busy: false, label: "", failed: false, partial: false });
   const download = async () => {
-    setState({ busy: true, label: "Готовлю PDF…", failed: false });
+    setState({ busy: true, label: "Готовлю PDF…", failed: false, partial: false });
     try {
-      await downloadCatalogPdf(products, {
+      const result = await downloadCatalogPdf(products, {
         whatsapp,
         category,
-        onProgress: (done, total) => setState({ busy: true, label: `Фото ${done} из ${total}…`, failed: false })
+        onProgress: (done, total) => setState({ busy: true, label: `Фото ${done} из ${total}…`, failed: false, partial: false })
       });
-      setState({ busy: false, label: "", failed: false });
-    } catch {
-      setState({ busy: false, label: "", failed: true });
+      setState({ busy: false, label: "", failed: false, partial: Boolean(result?.missing?.length) });
+    } catch (error) {
+      console.error("catalog PDF failed", error);
+      setState({ busy: false, label: "", failed: true, partial: false });
     }
   };
 
@@ -29,6 +30,7 @@ function CatalogPdfButton({ category }) {
         {state.busy ? state.label : category ? `Скачать PDF: ${category}` : "Скачать каталог PDF"}
       </button>
       {state.failed && <span className="shop-pdf-error">Не получилось, попробуйте ещё раз</span>}
+      {state.partial && <span className="shop-pdf-error">PDF скачан, но часть фото не загрузилась — попробуйте скачать ещё раз</span>}
     </div>
   );
 }
@@ -64,7 +66,11 @@ export default function Products() {
           {products.length > 0 && <CatalogPdfButton category={category} />}
         </header>
         <ProductGrid items={items} onShowAll={showAll} />
-        {!items.length && <p className="shop-empty">В этой категории пока пусто. Напишите мне — подберу под заказ.</p>}
+        {!items.length && (
+          <p className="shop-empty">
+            {catalogLoaded ? "В этой категории пока пусто. Напишите мне — подберу под заказ." : "Не удалось загрузить товары. Обновите страницу или напишите мне — подберу под заказ."}
+          </p>
+        )}
       </section>
 
       <ShopHelp title="Не нашли нужный размер?">

@@ -1,20 +1,10 @@
 import { existsSync, rmSync } from "node:fs";
 import { copyFile, mkdir, readdir, readFile, rename, rm, stat } from "node:fs/promises";
 import { dirname, join, relative, sep } from "node:path";
+import { listFiles } from "./files.js";
 import { createZipAsync } from "./zip.js";
 
 const dayOf = (date) => `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
-
-async function listFiles(dir) {
-  const entries = await readdir(dir, { withFileTypes: true }).catch(() => []);
-  const files = [];
-  for (const entry of entries) {
-    const full = join(dir, entry.name);
-    if (entry.isDirectory()) files.push(...(await listFiles(full)));
-    else if (entry.isFile()) files.push(full);
-  }
-  return files;
-}
 
 export function createBackups(config, db, { catalog, orders, clients }) {
   const { paths } = config;

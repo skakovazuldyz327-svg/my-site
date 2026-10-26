@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { ProductBadge } from "../components/ProductCard.jsx";
 import ShopHelp from "../components/ShopHelp.jsx";
-import { clampQty, formatPrice, productById, productImages, sizeInStock } from "../lib/catalog.js";
+import { catalogLoaded, clampQty, formatPrice, productById, productImages, sizeInStock } from "../lib/catalog.js";
 import { useShop } from "../shop/ShopContext.jsx";
 
 const product = productById(new URLSearchParams(location.search).get("id") || "");
@@ -175,11 +175,17 @@ export default function Product() {
             <Gallery />
             <ProductInfo />
           </article>
-        ) : (
+        ) : catalogLoaded ? (
           <div className="item-missing">
             <h1>Такого товара нет</h1>
             <p>Возможно, его уже убрали из каталога. Посмотрите другие модели или напишите мне — подберу похожую.</p>
             <a className="btn btn-solid" href="products.html">Смотреть все товары</a>
+          </div>
+        ) : (
+          <div className="item-missing">
+            <h1>Товар не загрузился</h1>
+            <p>Не удалось получить данные о товарах. Обновите страницу через минуту или напишите мне — отвечу лично.</p>
+            <button className="btn btn-solid" type="button" onClick={() => location.reload()}>Обновить страницу</button>
           </div>
         )}
       </section>

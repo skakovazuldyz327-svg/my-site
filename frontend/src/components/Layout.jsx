@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { waLink } from "../lib/catalog.js";
+import { contacts, waLink } from "../lib/catalog.js";
 import { ShopProvider } from "../shop/ShopContext.jsx";
 import Chat from "../chat/Chat.jsx";
 import ContactsDialog from "./ContactsDialog.jsx";
@@ -28,6 +28,11 @@ export default function Layout({ page, children }) {
       <ErrorBoundary fallback={pageCrashed}>{children}</ErrorBoundary>
       <footer className="site-footer">
         <p>© {new Date().getFullYear()} Жулдыз · ортопедические матрасы, кровати, аксессуары</p>
+        <p className="footer-contacts">
+          <a href={contacts.phoneHref}>{contacts.phone}</a>
+          <a href={waLink} target="_blank" rel="noopener">WhatsApp</a>
+          {contacts.email && <a href={`mailto:${contacts.email}`}>{contacts.email}</a>}
+        </p>
         <p>Жұлдыз — звезда. Пусть ночь будет тихой.</p>
       </footer>
       <ContactsDialog

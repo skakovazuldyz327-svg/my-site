@@ -1,6 +1,7 @@
-import { mkdir, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { localIso, shortId } from "./files.js";
+import { silentLogger } from "../log.js";
+import { localIso, readdirOrEmpty, shortId, statOrMissing } from "./files.js";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
@@ -30,7 +31,7 @@ export function insertChatFile(db, entry) {
 
 // The files themselves stay on disk under their random id only; the client's file name lives in the database and
 // never touches the disk path.
-export function createChatFiles(db, paths, limits, lock) {
+export function createChatFiles(db, paths, limits, lock, logger = silentLogger) {
   const rows = db.prepare("SELECT * FROM chat_files ORDER BY rowid");
   const fileOf = (id) => join(paths.chatFiles, id);
   const usedBytes = (entries) => entries.reduce((sum, entry) => sum + (Number(entry.size) || 0), 0);
@@ -77,14 +78,19 @@ export function createChatFiles(db, paths, limits, lock) {
       return lock(async () => {
         db.prepare("DELETE FROM chat_files WHERE time <= ?").run(now - limits.days * DAY_MS);
         const known = new Set(rows.all().map((row) => row.id));
-        const names = await readdir(paths.chatFiles).catch(() => []);
+        const names = await readdirOrEmpty(paths.chatFiles);
         let removed = 0;
         for (const name of names) {
           if (known.has(name)) continue;
-          const info = await stat(fileOf(name)).catch(() => null);
-          if (info && now - info.mtimeMs < limits.days * DAY_MS) continue;
-          await rm(fileOf(name), { force: true, recursive: true });
-          removed += 1;
+          // A file that cannot be looked at or removed now is left for the next cleanup, never removed on a guess.
+          try {
+            const info = await statOrMissing(fileOf(name));
+            if (!info || now - info.mtimeMs < limits.days * DAY_MS) continue;
+            await rm(fileOf(name), { force: true, recursive: true });
+            removed += 1;
+          } catch (error) {
+            logger.warn("a chat file was left in place: it could not be checked or removed", { file: name, code: error.code, message: error.message });
+          }
         }
         return removed;
       });

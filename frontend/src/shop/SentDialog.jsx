@@ -7,9 +7,14 @@ import { invoiceReady } from "../pdf/invoiceDoc.js";
 // No hard timeout: a phone freezes the page while the buyer is in WhatsApp, and the answer may be read only on return.
 const SLOW_MS = 20 * 1000;
 
-// sent.saved resolves to the order as the server saved it, or to null when the server did not confirm it.
+const PROBLEM_NOTES = {
+  queued: "Сайт сейчас не смог сохранить заказ — он отправится сам, как только связь появится. Главное — отправьте сообщение в WhatsApp, Жулдыз ответит там.",
+  rejected: "Сайт не принял заказ. Отправьте сообщение в WhatsApp — Жулдыз оформит заказ там.",
+};
+
+// sent.saved resolves to { state, invoice }: what became of the order on the server and the order as it was saved there.
 export default function SentDialog({ open, sent, onClose }) {
-  const [answer, setAnswer] = useState({ key: null, invoice: null });
+  const [answer, setAnswer] = useState({ key: null, invoice: null, state: "" });
   const [slowKey, setSlowKey] = useState(null);
   const [busy, setBusy] = useState(false);
   const [failed, setFailed] = useState(false);
@@ -18,8 +23,8 @@ export default function SentDialog({ open, sent, onClose }) {
     if (!sent) return undefined;
     let current = true;
     setFailed(false);
-    sent.saved.then((invoice) => {
-      if (current) setAnswer({ key: sent.key, invoice });
+    sent.saved.then(({ state, invoice }) => {
+      if (current) setAnswer({ key: sent.key, invoice, state });
     });
     const timer = setTimeout(() => setSlowKey(sent.key), SLOW_MS);
     return () => {
@@ -30,6 +35,7 @@ export default function SentDialog({ open, sent, onClose }) {
 
   const waiting = Boolean(sent) && answer.key !== sent.key && slowKey !== sent.key;
   const invoice = sent && answer.key === sent.key ? answer.invoice : null;
+  const problem = sent && answer.key === sent.key ? PROBLEM_NOTES[answer.state] : "";
   const ready = Boolean(invoice) && invoiceReady(invoice);
 
   // pdfmake (about 2 MB with the fonts) loads only when the buyer asks for the invoice.
@@ -51,7 +57,7 @@ export default function SentDialog({ open, sent, onClose }) {
       <div className="order-box">
         <button className="order-close" type="button" aria-label="Закрыть" onClick={onClose}>×</button>
         <p className="item-tag">Заявка</p>
-        <h3 id="sent-title">{invoice ? `Заказ № ${invoice.number} принят` : "Заказ отправлен"}</h3>
+        <h3 id="sent-title">{invoice ? `Заказ № ${invoice.number} принят` : problem ? "Заказ пока не сохранён на сайте" : "Заказ отправлен"}</h3>
         {waiting && <p className="order-note">Получаем номер заказа…</p>}
         {ready && (
           <p className="order-note">Жулдыз ответит в WhatsApp. Если нужен счёт на оплату для бухгалтерии, скачайте его здесь.</p>
@@ -59,7 +65,8 @@ export default function SentDialog({ open, sent, onClose }) {
         {invoice && !ready && (
           <p className="order-note">Жулдыз ответит в WhatsApp. Если нужен счёт на оплату, она пришлёт его там.</p>
         )}
-        {!waiting && !invoice && (
+        {problem && <p className="form-error" role="alert">{problem}</p>}
+        {!waiting && !invoice && !problem && (
           <p className="order-note">Номер заказа пока не пришёл. Если нужен счёт на оплату, Жулдыз пришлёт его в WhatsApp.</p>
         )}
         {ready && (

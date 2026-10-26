@@ -18,11 +18,11 @@ export function createStore(config, logger = silentLogger) {
     db.close();
     throw error;
   }
-  const catalog = createCatalog(db);
+  const catalog = createCatalog(db, logger);
   const clients = createClients(db);
   const orders = createOrders(db, { catalog, paths: config.paths, logger });
   const backups = createBackups(config, db, { catalog, orders, clients });
-  const chatFiles = createChatFiles(db, config.paths, config.chatFiles, createLock());
-  const photos = createPhotos(db, config.paths);
+  const chatFiles = createChatFiles(db, config.paths, config.chatFiles, createLock(), logger);
+  const photos = createPhotos(db, config.paths, logger);
   return { db, catalog, clients, orders, backups, chatFiles, photos, close: () => db.close() };
 }

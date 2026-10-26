@@ -149,7 +149,8 @@ function savePending(list) {
 }
 
 // A 4xx answer will not change on a retry; a 5xx or a network error keeps the order for the next visit.
-// Resolves to the server's answer for a saved order ({ number, invoice }), otherwise to null.
+// Resolves to { state, answer }: "saved" with the server's answer ({ number, invoice }), "rejected" when the server refused
+// the order for good, "queued" when it is kept to be sent again.
 function deliver(body) {
   return fetch("/api/orders", {
     method: "POST",
@@ -157,13 +158,13 @@ function deliver(body) {
     headers: { "Content-Type": "application/json; charset=utf-8" },
     body: JSON.stringify(body),
   })
-    .then((response) => {
-      if (response.status < 500 && response.status !== 408 && response.status !== 429) {
-        savePending(loadPending().filter((entry) => entry.body.key !== body.key));
-      }
-      return response.ok ? response.json().catch(() => null) : null;
+    .then(async (response) => {
+      const final = response.status < 500 && response.status !== 408 && response.status !== 429;
+      if (final) savePending(loadPending().filter((entry) => entry.body.key !== body.key));
+      if (!response.ok) return { state: final ? "rejected" : "queued", answer: null };
+      return { state: "saved", answer: await response.json().catch(() => null) };
     })
-    .catch(() => null);
+    .catch(() => ({ state: "queued", answer: null }));
 }
 
 export function retryPendingOrders() {
@@ -173,12 +174,15 @@ export function retryPendingOrders() {
   list.forEach((entry) => deliver(entry.body));
 }
 
-// Resolves to the order as the server saved it, for the invoice (null when the server did not confirm it).
+export const SEND_FAILED = "Не получилось отправить заказ. Ваши данные и товары сохранены — нажмите ещё раз или напишите Жулдыз в WhatsApp.";
+
+// Resolves to { state, invoice }: the state of deliver ("local" for a page opened as a file) and the order as the server
+// saved it, for the invoice (null when the server did not confirm it).
 export function sendOrder(items, client) {
   const { name, phone, company = "", bin = "", address = "" } = client;
   storageSet(CLIENT_KEY, JSON.stringify({ name, phone, company, bin, address }));
   const url = `https://wa.me/${whatsapp}?text=${encodeURIComponent(orderMessage(items, client))}`;
-  let saved = Promise.resolve(null);
+  let saved = Promise.resolve({ state: "local", invoice: null });
   if (location.protocol !== "file:") {
     // Name and price travel too, so the order is still recorded if the admin removes the product meanwhile.
     const body = {
@@ -194,7 +198,7 @@ export function sendOrder(items, client) {
       }),
     };
     savePending([...loadPending(), { body, time: Date.now() }]);
-    saved = deliver(body).then((answer) => answer?.invoice || null);
+    saved = deliver(body).then(({ state, answer }) => ({ state, invoice: answer?.invoice || null }));
   }
   openWhatsApp(url);
   return saved;

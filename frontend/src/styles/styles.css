@@ -1064,6 +1064,17 @@ input[type="number"]::-webkit-inner-spin-button {
   color: var(--clay);
 }
 
+.catalog-alert {
+  position: relative;
+  z-index: 5;
+  margin: 0;
+  padding: 0.7rem 6vw;
+  font-size: 0.88rem;
+  text-align: center;
+  color: #fff;
+  background: var(--clay);
+}
+
 .order-box input[aria-invalid="true"] {
   border-color: var(--clay);
 }
@@ -1076,6 +1087,16 @@ input[type="number"]::-webkit-inner-spin-button {
   padding: 1.3rem 6vw 2rem;
   font-size: 0.82rem;
   color: var(--muted);
+}
+
+.footer-contacts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem 1rem;
+}
+
+.footer-contacts a {
+  color: inherit;
 }
 
 @media (prefers-reduced-motion: reduce) {

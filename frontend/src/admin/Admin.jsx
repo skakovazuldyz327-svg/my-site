@@ -1,4 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import Dialog from "../components/Dialog.jsx";
+import ErrorBoundary from "../components/ErrorBoundary.jsx";
 import ClientsPanel from "./ClientsPanel.jsx";
 import CompanyPanel from "./CompanyPanel.jsx";
 import FilesPanel from "./FilesPanel.jsx";
@@ -40,22 +42,52 @@ const LOGIN_ERRORS = {
   wrong: "Неверный пароль",
   local: "Пароль админки стандартный, поэтому админка открывается только на компьютере, где запущен сайт. Чтобы входить с других устройств, задайте свой пароль ADMIN_PASSWORD в файле .env и перезапустите сайт.",
   locked: "Слишком много неверных попыток. Попробуйте через 15 минут.",
+  expired: "Сайт больше не принимает сохранённый пароль — возможно, его сменили в .env. Войдите заново.",
+  server: "Сайт ответил ошибкой — пароль тут ни при чём. Попробуйте ещё раз через минуту; если не поможет, перезапустите сайт.",
+  timeout: "Сайт долго не отвечает. Проверьте, что он запущен, и попробуйте ещё раз.",
   offline: "Сайт не отвечает. Он запущен?",
 };
 
+const LOAD_ERRORS = {
+  server: "Сайт ответил ошибкой и не отдал данные. Попробуйте ещё раз через минуту; если не поможет, перезапустите сайт.",
+  timeout: "Сайт долго не отвечает. Проверьте, что он запущен, и попробуйте ещё раз.",
+  offline: "Нет связи с сайтом. Проверьте, что он запущен и компьютер в сети.",
+};
+
+// Only the login and the loads that fill the page wait this long; uploads and saves may legitimately take longer.
+const REQUEST_TIMEOUT_MS = 15 * 1000;
+
+// kind: "auth" (the password is wrong or was changed), "server" (the site answered with an error), "timeout" or "offline".
+function requestError(kind, status = 0) {
+  const error = new Error(kind === "server" ? `HTTP ${status}` : kind);
+  error.kind = kind;
+  error.status = status;
+  return error;
+}
+
+const failureKind = (error) => (error?.name === "TimeoutError" ? "timeout" : "offline");
+
 async function checkPassword(password) {
   try {
-    const response = await fetch("/api/login", { method: "POST", headers: { "X-Admin-Password": password } });
+    const response = await fetch("/api/login", {
+      method: "POST",
+      headers: { "X-Admin-Password": password },
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+    });
     if (response.ok) return "ok";
-    return response.status === 403 ? "local" : response.status === 429 ? "locked" : "wrong";
-  } catch {
-    return "offline";
+    if (response.status === 401) return "wrong";
+    if (response.status === 403) return "local";
+    if (response.status === 429) return "locked";
+    return "server";
+  } catch (error) {
+    return failureKind(error);
   }
 }
 
-function LoginForm({ onLogin }) {
+function LoginForm({ initialError = "", onLogin }) {
   const [password, setPassword] = useState("");
-  const [failed, setFailed] = useState("");
+  const [failed, setFailed] = useState(initialError);
+  const [busy, setBusy] = useState(false);
 
   return (
     <section className="panel login">
@@ -63,24 +95,95 @@ function LoginForm({ onLogin }) {
       <form
         onSubmit={async (event) => {
           event.preventDefault();
-          const result = await onLogin(password);
-          setFailed(result === "ok" ? "" : result);
+          setBusy(true);
+          setFailed("");
+          try {
+            const result = await onLogin(password);
+            setFailed(result === "ok" ? "" : result);
+          } finally {
+            setBusy(false);
+          }
         }}
       >
         <label>
           Пароль
           <input type="password" autoComplete="current-password" required value={password} onChange={(event) => setPassword(event.target.value)} />
         </label>
-        <button className="btn btn-solid" type="submit">Войти</button>
-        {failed && <p className="error">{LOGIN_ERRORS[failed]}</p>}
+        <button className="btn btn-solid" type="submit" disabled={busy}>{busy ? "Проверяем…" : "Войти"}</button>
+        {failed && <p className="error" role="alert">{LOGIN_ERRORS[failed] || LOAD_ERRORS[failed]}</p>}
       </form>
     </section>
   );
 }
 
+// Shown while the saved password is checked and the page data loads, and in place of the page when that failed.
+function LoadState({ error, onRetry }) {
+  return (
+    <section className="panel login load-state" aria-live="polite">
+      {error ? (
+        <>
+          <h1>Админка не загрузилась</h1>
+          <p className="error" role="alert">{LOAD_ERRORS[error] || LOGIN_ERRORS[error]}</p>
+          <button className="btn btn-solid" type="button" onClick={onRetry}>Повторить</button>
+        </>
+      ) : (
+        <p className="load-wait"><span className="spinner" aria-hidden="true"></span>Загружаем админку…</p>
+      )}
+    </section>
+  );
+}
+
+const CRASH_NOTE = "Обновите страницу; если повторится, скачайте полную копию внизу страницы и пришлите её вместе с файлом server-log.txt из папки сайта.";
+
+// Takes the place of one section that failed to draw (e.g. an unexpected old record); the other sections keep working.
+// hidden is passed on, so a crashed section on another tab does not show over the open one.
+function PanelCrashed({ title, hidden = false }) {
+  return (
+    <section className="panel" hidden={hidden}>
+      <h1>{title}</h1>
+      <p className="error" role="alert">Этот раздел не открылся, остальные работают. {CRASH_NOTE}</p>
+      <button className="btn btn-ghost" type="button" onClick={() => location.reload()}>Обновить страницу</button>
+    </section>
+  );
+}
+
+function EditorCrashed({ onClose }) {
+  return (
+    <Dialog id="editor-crashed" open onClose={onClose} className="editor-dialog" labelledBy="editor-crashed-title">
+      <h2 id="editor-crashed-title">Редактор товара не открылся</h2>
+      <p className="error" role="alert">Изменения не сохранены. {CRASH_NOTE}</p>
+      <button className="btn btn-ghost" type="button" onClick={onClose}>Закрыть</button>
+    </Dialog>
+  );
+}
+
+const DAMAGED_SETTINGS = { whatsapp: "номер WhatsApp", email: "почта", company: "реквизиты для счёта" };
+
+// Damaged rows are left out by the server: without this the owner would not know a product or a setting is missing.
+function DamagedAlert({ rows }) {
+  const names = rows.map((row) => (row.kind === "product" ? `товар с кодом ${row.id}` : `настройка «${DAMAGED_SETTINGS[row.id] || row.id}»`));
+  return (
+    <div className="sync-alert" role="alert">
+      <p>
+        В базе повреждены записи, поэтому их нет ни на сайте, ни здесь: {names.join(", ")}. Восстановите базу из ежедневной копии:
+        закройте сайт и запустите restore-backup.bat. Текущая база при этом не удаляется, а сохраняется отдельным файлом — заказы, принятые после копии, останутся в нём.
+      </p>
+    </div>
+  );
+}
+
 export default function Admin() {
-  const [view, setView] = useState("");
   const password = useRef(storageGet("adminPassword", "sessionStorage") || "");
+  // "loading": the saved password is checked and the data loads (or failed to: loadError); "login"; "panel".
+  const [view, setView] = useState(() => (password.current ? "loading" : "login"));
+  const [loadError, setLoadError] = useState("");
+  const [loginNote, setLoginNote] = useState("");
+  // A refresh of the orders or of the catalog failed: what is on screen may be behind the site. Kept apart, so one part
+  // loading fine does not hide that the other did not.
+  const [lost, setLost] = useState({ orders: false, catalog: false });
+  const syncLost = lost.orders || lost.catalog;
+  const markLost = useCallback((part, value) => setLost((current) => (current[part] === value ? current : { ...current, [part]: value })), []);
+  const [email, setEmail] = useState("");
   const [data, setData] = useState(null);
   const [orders, setOrders] = useState([]);
   const [clients, setClients] = useState([]);
@@ -98,18 +201,31 @@ export default function Admin() {
     setView("login");
   }, []);
 
-  const api = useCallback(async (path, options = {}) => {
-    const response = await fetch(path, {
-      ...options,
-      headers: { "X-Admin-Password": password.current, ...(options.headers || {}) },
-    });
-    if (response.status === 401) {
-      logout();
-      throw new Error("auth");
-    }
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
-    return response.json();
+  // The site stopped taking the password (changed in .env and restarted): the login form says so instead of appearing silently.
+  const expired = useCallback(() => {
+    setLoginNote("expired");
+    logout();
   }, [logout]);
+
+  // options.timeout (ms) gives up on a request that hangs; the error says why the request failed (see requestError).
+  const api = useCallback(async (path, { timeout, ...options } = {}) => {
+    let response;
+    try {
+      response = await fetch(path, {
+        ...options,
+        ...(timeout ? { signal: AbortSignal.timeout(timeout) } : {}),
+        headers: { "X-Admin-Password": password.current, ...(options.headers || {}) },
+      });
+    } catch (error) {
+      throw requestError(failureKind(error));
+    }
+    if (response.status === 401) {
+      expired();
+      throw requestError("auth", 401);
+    }
+    if (!response.ok) throw requestError("server", response.status);
+    return response.json();
+  }, [expired]);
 
   // A list fetched while a status change or deletion was on its way may predate it and would undo it on screen;
   // so may an older load that answers after a newer one.
@@ -129,31 +245,40 @@ export default function Admin() {
     const before = edits.current.count;
     const load = ++edits.current.loads;
     try {
-      const [nextOrders, nextClients] = await Promise.all([api("/api/orders"), api("/api/clients")]);
+      const [nextOrders, nextClients] = await Promise.all([
+        api("/api/orders", { timeout: REQUEST_TIMEOUT_MS }),
+        api("/api/clients", { timeout: REQUEST_TIMEOUT_MS }),
+      ]);
+      markLost("orders", false);
       if (edits.current.running || edits.current.count !== before || edits.current.loads !== load) return;
       setOrders(Array.isArray(nextOrders) ? nextOrders : []);
       setClients(Array.isArray(nextClients) ? nextClients : []);
     } catch (error) {
-      if (!quiet && error.message !== "auth") toast("Не удалось загрузить заказы", true);
+      if (error.kind === "auth") return;
+      markLost("orders", true);
+      if (!quiet) toast(`Не удалось загрузить заказы. ${LOAD_ERRORS[error.kind] || ""}`, true);
     }
-  }, [api, toast]);
+  }, [api, toast, markLost]);
 
   // Stock moves with every order, so the product list is reloaded too, but never under an open editor: its "base" must stay
   // the product as the editor first showed it. A load that started before a save answers with the older catalog and is dropped.
   const editingRef = useRef(null);
   const catalogVersion = useRef(0);
+  // Resolves to the catalog, null when the load was dropped as above, false when it failed.
   const loadCatalog = useCallback(async () => {
     const version = catalogVersion.current;
     try {
-      const catalog = await api("/api/admin/products");
+      const catalog = await api("/api/admin/products", { timeout: REQUEST_TIMEOUT_MS });
+      markLost("catalog", false);
       if (editingRef.current || catalogVersion.current !== version) return null;
       const next = { ...catalog, settings: catalog.settings || {}, products: catalog.products || [] };
       setData(next);
       return next;
-    } catch {
-      return null;
+    } catch (error) {
+      if (error.kind !== "auth") markLost("catalog", true);
+      return false;
     }
-  }, [api]);
+  }, [api, markLost]);
 
   const loadChatFiles = useCallback(async () => {
     try {
@@ -167,28 +292,45 @@ export default function Admin() {
     }
   }, [api, toast]);
 
+  // A failed first load leaves the loading screen with the reason and «Повторить» instead of an empty page.
   const openPanel = useCallback(async () => {
+    setLoadError("");
+    setView("loading");
     let catalog;
     try {
-      catalog = await api("/api/admin/products");
+      catalog = await api("/api/admin/products", { timeout: REQUEST_TIMEOUT_MS });
     } catch (error) {
-      if (error.message !== "auth") toast("Не удалось загрузить товары", true);
-      return;
+      if (error.kind !== "auth") setLoadError(error.kind);
+      return false;
     }
     catalog.settings = catalog.settings || {};
     catalog.products = catalog.products || [];
     setData(catalog);
     setWhatsapp(catalog.settings.whatsapp || "");
+    setEmail(catalog.settings.email || "");
+    setLost({ orders: false, catalog: false });
     setView("panel");
     await Promise.all([loadOrders(), loadChatFiles()]);
-  }, [api, loadOrders, loadChatFiles, toast]);
+    return true;
+  }, [api, loadOrders, loadChatFiles]);
+
+  // A saved password the site no longer takes leads to the login form with the reason; a site that cannot answer does not.
+  const start = useCallback(async () => {
+    setLoadError("");
+    setView("loading");
+    const result = await checkPassword(password.current);
+    if (result === "ok") await openPanel();
+    else if (LOAD_ERRORS[result]) setLoadError(result);
+    else if (result === "wrong") expired();
+    else {
+      setLoginNote(result);
+      setView("login");
+    }
+  }, [openPanel, expired]);
 
   useEffect(() => {
-    (async () => {
-      if (password.current && (await checkPassword(password.current)) === "ok") await openPanel();
-      else setView("login");
-    })();
-  }, [openPanel]);
+    if (password.current) start();
+  }, [start]);
 
   // New orders appear without pressing «Обновить»; a hidden tab does not poll and catches up once it is shown again.
   useEffect(() => {
@@ -215,8 +357,14 @@ export default function Admin() {
     if (result !== "ok") return result;
     password.current = value;
     storageSet("adminPassword", value, "sessionStorage");
+    setLoginNote("");
     await openPanel();
     return "ok";
+  };
+
+  const refreshNow = () => {
+    loadOrders();
+    loadCatalog();
   };
 
   // The server answers with the whole current catalog, so changes made in another admin window show up here too.
@@ -228,7 +376,7 @@ export default function Admin() {
         body: JSON.stringify(body),
       });
       if (response.status === 401) {
-        logout();
+        expired();
         return false;
       }
       const result = await response.json().catch(() => null);
@@ -316,7 +464,7 @@ export default function Admin() {
     try {
       const response = await fetch(`/api/chat/files/download?id=${encodeURIComponent(file.id)}`, { headers: { "X-Admin-Password": password.current } });
       if (response.status === 401) {
-        logout();
+        expired();
         return;
       }
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
@@ -358,6 +506,7 @@ export default function Admin() {
   // The editor opens on fresh counts: orders may have taken pieces since the list was loaded.
   const editProduct = async (product) => {
     const catalog = await loadCatalog();
+    if (catalog === false) toast("Нет связи с сайтом — в редакторе остатки на момент последней загрузки", true);
     const fresh = catalog ? catalog.products.find((entry) => entry.id === product.id) : product;
     if (!fresh) {
       toast("Этот товар только что удалили в другом окне", true);
@@ -374,15 +523,21 @@ export default function Admin() {
     if (editing?.product?.id === product.id) setEditing(null);
   };
 
-  const saveWhatsapp = async (event) => {
+  const saveContacts = async (event) => {
     event.preventDefault();
     const phone = normalizePhone(whatsapp);
     if (phone.length < 10) {
       toast("Проверьте номер", true);
       return;
     }
+    const address = email.trim();
+    if (address && !/^[^\s@<>"]+@[^\s@<>"]+\.[^\s@<>"]+$/.test(address)) {
+      toast("Проверьте почту — например, name@mail.kz. Если почты нет, оставьте поле пустым.", true);
+      return;
+    }
     setWhatsapp(phone);
-    await changeCatalog("/api/settings", { whatsapp: phone }, "Номер сохранён");
+    setEmail(address);
+    await changeCatalog("/api/settings", { whatsapp: phone, email: address }, "Контакты сохранены");
   };
 
   const downloadBackup = async () => {
@@ -390,7 +545,7 @@ export default function Admin() {
     try {
       const response = await fetch("/api/backup", { headers: { "X-Admin-Password": password.current } });
       if (response.status === 401) {
-        logout();
+        expired();
         return;
       }
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
@@ -425,14 +580,22 @@ export default function Admin() {
 
   const saveCompany = (company) => changeCatalog("/api/settings/company", { company }, "Реквизиты сохранены");
 
-  // One PDF at a time; the button that started it shows the progress.
+  // One PDF at a time; the button that started it shows the progress. A PDF that came out without some photos
+  // (result.missing) is said so, or it would be sent to buyers with empty frames.
   const makePdf = async (key, task, message = "PDF скачан") => {
     if (pdfJob) return;
     setPdfJob({ key, label: "Готовлю PDF…" });
     try {
-      await task((done, total) => setPdfJob({ key, label: `Фото ${done} из ${total}…` }));
-      toast(message);
-    } catch {
+      const result = await task((done, total) => setPdfJob({ key, label: `Фото ${done} из ${total}…` }));
+      const missing = Array.isArray(result?.missing) ? result.missing : [];
+      if (missing.length) {
+        const names = missing.slice(0, 3).join(", ") + (missing.length > 3 ? ` и ещё ${missing.length - 3}` : "");
+        toast(`PDF скачан, но без фото: ${names}. Проверьте фото у этих товаров и скачайте PDF ещё раз.`, true);
+      } else {
+        toast(message);
+      }
+    } catch (error) {
+      console.error("PDF failed", error);
       toast("Не удалось сделать PDF. Попробуйте ещё раз.", true);
     } finally {
       setPdfJob(null);
@@ -481,7 +644,17 @@ export default function Admin() {
       </header>
 
       <main className="admin-main">
-        {view === "login" && <LoginForm onLogin={login} />}
+        {view === "loading" && <LoadState error={loadError} onRetry={start} />}
+        {view === "login" && <LoginForm key={loginNote} initialError={loginNote} onLogin={login} />}
+
+        {view === "panel" && syncLost && (
+          <div className="sync-alert" role="alert">
+            <p>Связь с сервером потеряна. Данные могут быть устаревшими.</p>
+            <button className="btn btn-ghost" type="button" onClick={refreshNow}>Повторить</button>
+          </div>
+        )}
+
+        {view === "panel" && data?.damaged?.length > 0 && <DamagedAlert rows={data.damaged} />}
 
         {view === "panel" && data && (
           <div className="admin-grid">
@@ -499,50 +672,64 @@ export default function Admin() {
               ))}
             </nav>
 
-            <OrdersPanel
-              hidden={tab !== "orders"}
-              orders={orders}
-              freshLabel={freshLabel}
-              onRefresh={loadOrders}
-              onStatus={setOrderStatus}
-              onDelete={deleteOrder}
-              pdfJob={pdfJob}
-              onPdf={orderPdf}
-              onInvoice={invoicePdf}
-              onBuyer={saveBuyer}
-            />
-            <ClientsPanel hidden={tab !== "clients"} clients={clients} orders={orders} onHide={setClientHidden} onDelete={deleteClient} />
-            <ProductsPanel
-              hidden={tab !== "products"}
-              products={products}
-              editingId={editing?.product?.id}
-              onAdd={() => setEditing({ product: null, key: Date.now() })}
-              onEdit={editProduct}
-              onRemove={removeProduct}
-              pdfJob={pdfJob}
-              onCatalogPdf={catalogPdf}
-            />
-            <FilesPanel
-              hidden={tab !== "files"}
-              files={chatFiles.files}
-              usage={chatFiles.usage}
-              onRefresh={loadChatFiles}
-              onDownload={downloadChatFile}
-              onDelete={deleteChatFile}
-            />
+            <ErrorBoundary resetKey={orders} fallback={<PanelCrashed title="Заказы" hidden={tab !== "orders"} />}>
+              <OrdersPanel
+                hidden={tab !== "orders"}
+                orders={orders}
+                freshLabel={freshLabel}
+                onRefresh={loadOrders}
+                onStatus={setOrderStatus}
+                onDelete={deleteOrder}
+                pdfJob={pdfJob}
+                onPdf={orderPdf}
+                onInvoice={invoicePdf}
+                onBuyer={saveBuyer}
+              />
+            </ErrorBoundary>
+            <ErrorBoundary resetKey={clients} fallback={<PanelCrashed title="Клиенты" hidden={tab !== "clients"} />}>
+              <ClientsPanel hidden={tab !== "clients"} clients={clients} orders={orders} onHide={setClientHidden} onDelete={deleteClient} />
+            </ErrorBoundary>
+            <ErrorBoundary resetKey={products} fallback={<PanelCrashed title="Товары" hidden={tab !== "products"} />}>
+              <ProductsPanel
+                hidden={tab !== "products"}
+                products={products}
+                editingId={editing?.product?.id}
+                onAdd={() => setEditing({ product: null, key: Date.now() })}
+                onEdit={editProduct}
+                onRemove={removeProduct}
+                pdfJob={pdfJob}
+                onCatalogPdf={catalogPdf}
+              />
+            </ErrorBoundary>
+            <ErrorBoundary resetKey={chatFiles.files} fallback={<PanelCrashed title="Файлы из чата" hidden={tab !== "files"} />}>
+              <FilesPanel
+                hidden={tab !== "files"}
+                files={chatFiles.files}
+                usage={chatFiles.usage}
+                onRefresh={loadChatFiles}
+                onDownload={downloadChatFile}
+                onDelete={deleteChatFile}
+              />
+            </ErrorBoundary>
 
             <section className="panel settings-panel">
-              <h2>WhatsApp для заказов</h2>
-              <form onSubmit={saveWhatsapp}>
+              <h2>Контакты на сайте</h2>
+              <form onSubmit={saveContacts} noValidate>
                 <label>
-                  Номер
+                  WhatsApp и телефон для заказов
                   <input name="whatsapp" inputMode="tel" placeholder="87778492164" value={whatsapp} onChange={(event) => setWhatsapp(event.target.value)} />
                 </label>
-                <button className="btn btn-ghost" type="submit">Сохранить номер</button>
+                <label>
+                  Почта (необязательно — без неё на сайте её не будет)
+                  <input name="email" type="email" inputMode="email" autoComplete="email" maxLength={120} placeholder="name@mail.kz" value={email} onChange={(event) => setEmail(event.target.value)} />
+                </label>
+                <button className="btn btn-ghost" type="submit">Сохранить контакты</button>
               </form>
             </section>
 
-            <CompanyPanel key={JSON.stringify(data.settings.company ?? null)} company={data.settings.company} onSave={saveCompany} />
+            <ErrorBoundary resetKey={data.settings.company} fallback={<PanelCrashed title="Реквизиты для счёта" />}>
+              <CompanyPanel key={JSON.stringify(data.settings.company ?? null)} company={data.settings.company} onSave={saveCompany} />
+            </ErrorBoundary>
 
             <section className="panel settings-panel">
               <h2>Резервная копия</h2>
@@ -554,15 +741,17 @@ export default function Admin() {
       </main>
 
       {editing && (
-        <ProductEditor
-          key={editing.key}
-          product={editing.product}
-          categories={categories}
-          api={api}
-          toast={toast}
-          onSave={saveProduct}
-          onClose={() => setEditing(null)}
-        />
+        <ErrorBoundary resetKey={editing.key} fallback={<EditorCrashed onClose={() => setEditing(null)} />}>
+          <ProductEditor
+            key={editing.key}
+            product={editing.product}
+            categories={categories}
+            api={api}
+            toast={toast}
+            onSave={saveProduct}
+            onClose={() => setEditing(null)}
+          />
+        </ErrorBoundary>
       )}
 
       {toastNode}

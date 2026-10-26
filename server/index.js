@@ -1,10 +1,12 @@
 import { spawn } from "node:child_process";
+import { existsSync, readdirSync } from "node:fs";
 import { createAi } from "./ai/index.js";
 import { createApp } from "./app.js";
 import { DEFAULT_ADMIN_PASSWORD, loadConfig } from "./config.js";
 import { holdFolder } from "./instance.js";
 import { createLogger } from "./log.js";
 import { createStore } from "./store/index.js";
+import { listBackups } from "./store/restore.js";
 
 // After this long a crash is a rare accident, not a crash loop, so start-site.bat forgets the earlier ones.
 const HEALTHY_RUN_SECONDS = 10 * 60;
@@ -16,6 +18,25 @@ if (!(await holdFolder(config.root))) {
   logger.error("the site is already running from this folder in another window - close that window or run stop-site.bat");
   await logger.flush();
   process.exit(2);
+}
+
+// A missing database file would be made anew with order numbers from 1, giving out numbers clients already have.
+// With earlier data around that is an accident (moved file, broken restore), so the site waits for the owner instead.
+if (!existsSync(config.paths.database) && !process.argv.includes("--new-database")) {
+  let earlier = [];
+  try {
+    earlier = [
+      ...readdirSync(config.paths.db).filter((name) => /^before-restore-.+\.sqlite$|^zhuldyz\.sqlite\.tmp$/.test(name)),
+      ...listBackups(config.paths).map((backup) => `backups/${backup.day}`)
+    ];
+  } catch (error) {
+    if (error.code !== "ENOENT") earlier = [`earlier data could not be checked: ${error.message}`];
+  }
+  if (earlier.length) {
+    logger.error("db/zhuldyz.sqlite is missing but earlier data exists - the site was not started so order numbers are not given out again; put the file back or run restore-backup.bat, or start with --new-database to begin an empty one", { found: earlier.slice(0, 10) });
+    await logger.flush();
+    process.exit(2);
+  }
 }
 
 let store;

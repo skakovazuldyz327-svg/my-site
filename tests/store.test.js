@@ -4,10 +4,10 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { inflateRawSync } from "node:zlib";
 import { after, test } from "node:test";
-import { localIso } from "../server/store/files.js";
+import { localIso, readdirOrEmpty, statOrMissing } from "../server/store/files.js";
 import { createStore } from "../server/store/index.js";
 import { LegacyFileError } from "../server/store/legacy.js";
-import { listBackups, restoreBackup } from "../server/store/restore.js";
+import { CounterUnreadableError, listBackups, restoreBackup } from "../server/store/restore.js";
 import { tempSite } from "./helpers.js";
 
 const site = tempSite();
@@ -84,6 +84,55 @@ test("bad orders are rejected", async () => {
   assert.equal(await store.orders.add(null), 0);
 });
 
+test("damaged catalog rows are listed for the admin and logged once, but not shown to visitors", () =>
+  withSite(null, async (other) => {
+    const errors = [];
+    const logger = { info() {}, warn() {}, error: (message, data) => errors.push({ message, data }) };
+    const shop = createStore(other.config, logger);
+    try {
+      const [first, second] = (await shop.catalog.read()).products;
+      assert.equal("damaged" in (await shop.catalog.read()), false);
+      shop.db.prepare("UPDATE products SET data = '{broken' WHERE id = ?").run(first.id);
+      shop.db.prepare("UPDATE settings SET value = '{broken' WHERE key = 'whatsapp'").run();
+      const catalog = await shop.catalog.read();
+      assert.deepEqual(catalog.damaged, [{ kind: "setting", id: "whatsapp" }, { kind: "product", id: first.id }]);
+      assert.equal(catalog.products[0].id, second.id);
+      assert.equal("whatsapp" in catalog.settings, false);
+      await shop.catalog.read();
+      assert.equal("damaged" in (await shop.catalog.shown()), false);
+      assert.doesNotMatch(await shop.catalog.page(), /damaged/);
+      const logged = errors.filter((entry) => entry.message.startsWith("damaged rows"));
+      assert.equal(logged.length, 1);
+      assert.deepEqual(logged[0].data.rows, catalog.damaged);
+      shop.db.prepare("UPDATE products SET data = ? WHERE id = ?").run(JSON.stringify(first), first.id);
+      shop.db.prepare("UPDATE settings SET value = ? WHERE key = 'whatsapp'").run(JSON.stringify("77001234567"));
+      assert.equal("damaged" in (await shop.catalog.read()), false);
+    } finally {
+      shop.close();
+    }
+  }));
+
+test("a refused order is logged with the reason and the buyer's details", () =>
+  withSite(null, async (other) => {
+    const warnings = [];
+    const logger = { info() {}, error() {}, warn: (message, data) => warnings.push({ message, data }) };
+    const shop = createStore(other.config, logger);
+    try {
+      await shop.orders.add(order({ name: "A" }));
+      await shop.orders.add(order({ phone: "123" }));
+      await shop.orders.add(order({ items: [{ id: "nope", size: "90×200", qty: 1 }] }));
+      await shop.orders.add(null);
+      const refused = warnings.filter((entry) => entry.message === "an order was refused");
+      assert.deepEqual(refused.map((entry) => entry.data.reason), ["name", "phone", "items", "payload"]);
+      assert.equal(refused[1].data.name, "Айгуль");
+      assert.equal(refused[1].data.phone, "123");
+      assert.deepEqual(refused[2].data.items, [{ id: "nope", name: "", size: "90×200", qty: "1" }]);
+      assert.equal(await shop.orders.add(order()), 1);
+    } finally {
+      shop.close();
+    }
+  }));
+
 test("parallel orders get unique, increasing numbers", async () => {
   const numbers = await Promise.all(Array.from({ length: 15 }, () => store.orders.add(order())));
   assert.equal(new Set(numbers).size, 15);
@@ -149,6 +198,12 @@ test("two admin windows do not erase each other's catalog changes", async () => 
   assert.equal(now.products.find((product) => product.id === second.id).price, 777);
   assert.equal(now.products.length, windowA.products.length);
   assert.equal(now.settings.whatsapp, "77770001122");
+  assert.equal(now.settings.email, undefined);
+
+  assert.equal((await store.catalog.saveSettings({ whatsapp: "77770001122", email: "not an address" })).ok, false);
+  assert.equal((await store.catalog.saveSettings({ whatsapp: "77770001122", email: " shop@mail.kz " })).catalog.settings.email, "shop@mail.kz");
+  assert.equal((await store.catalog.saveSettings({ whatsapp: "77770001123" })).catalog.settings.email, "shop@mail.kz");
+  assert.equal((await store.catalog.saveSettings({ whatsapp: "77770001122", email: "" })).catalog.settings.email, "");
 
   const stale = await store.catalog.saveProduct({ product: { ...first, price: 5 }, base: { ...first, price: -1 } });
   assert.equal(stale.ok, false);
@@ -801,6 +856,61 @@ test("a daily copy is restored without losing the database it replaces", () =>
       assert.equal(old.prepare("SELECT COUNT(*) AS count FROM orders").get().count, 2);
     } finally {
       old.close();
+    }
+  }));
+
+test("cleanup helpers decide only from a confirmed missing file, never from a folder they could not read", () =>
+  withSite(null, async (other) => {
+    createStore(other.config).close();
+    const { db, database } = other.config.paths;
+    assert.equal(await statOrMissing(join(db, "no-such-file"), { delayMs: 1 }), null);
+    assert.ok(await statOrMissing(database));
+    assert.deepEqual(await readdirOrEmpty(join(db, "no-such-folder")), []);
+    await assert.rejects(readdirOrEmpty(database), (error) => error.code !== "ENOENT");
+  }));
+
+test("a damaged or foreign copy is refused before the live database is touched", () =>
+  withSite(null, async (other) => {
+    const live = createStore(other.config);
+    await live.orders.add(order());
+    live.close();
+    const { db, database } = other.config.paths;
+    const before = readFileSync(database);
+
+    const garbage = join(db, "garbage.sqlite");
+    writeFileSync(garbage, "not a database");
+    const foreign = join(db, "foreign.sqlite");
+    const stranger = new DatabaseSync(foreign);
+    stranger.exec("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
+    stranger.close();
+
+    assert.throws(() => restoreBackup(other.config.paths, { day: "garbage", file: garbage }), /garbage was not restored, nothing was changed/);
+    assert.throws(() => restoreBackup(other.config.paths, { day: "foreign", file: foreign }), /no settings, products, orders/);
+    assert.deepEqual(readFileSync(database), before);
+    assert.deepEqual(readdirSync(db).filter((name) => /^before-restore-|\.tmp/.test(name)), []);
+  }));
+
+test("a restore never resets the order counter: an unreadable one stops it unless the owner gives the last number", () =>
+  withSite(null, async (other) => {
+    const live = createStore(other.config);
+    await live.orders.add(order());
+    await live.backups.daily();
+    live.close();
+    const [backup] = listBackups(other.config.paths);
+    const { db, database } = other.config.paths;
+    writeFileSync(database, "not a database");
+
+    assert.throws(() => restoreBackup(other.config.paths, backup), (error) => error instanceof CounterUnreadableError);
+    assert.equal(readFileSync(database, "utf8"), "not a database");
+    assert.deepEqual(readdirSync(db).filter((name) => /^before-restore-|\.tmp/.test(name)), []);
+
+    const kept = restoreBackup(other.config.paths, backup, { lastNumber: 7 });
+    assert.equal(readFileSync(join(db, kept), "utf8"), "not a database");
+    const restored = createStore(other.config);
+    try {
+      assert.equal(await restored.orders.add(order()), 8);
+    } finally {
+      restored.close();
     }
   }));
 

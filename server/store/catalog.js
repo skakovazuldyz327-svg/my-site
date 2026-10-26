@@ -1,3 +1,4 @@
+import { silentLogger } from "../log.js";
 import { parseColumn, transaction } from "./db.js";
 import { allStock, MAX_STOCK, stockOf, withStock, writeStock } from "./stock.js";
 
@@ -94,33 +95,45 @@ export function insertProduct(db, product, position) {
   db.prepare("INSERT INTO products (id, position, data) VALUES (?, ?, ?)").run(product.id, position, JSON.stringify(product));
 }
 
+// The same check the shop pages make before showing the address.
+const EMAIL = /^[^\s@<>"]+@[^\s@<>"]+\.[^\s@<>"]+$/;
+
 export function saveSetting(db, key, value) {
   db.prepare("INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value").run(key, JSON.stringify(value));
 }
 
-export function createCatalog(db) {
+export function createCatalog(db, logger = silentLogger) {
   const settingRows = db.prepare("SELECT key, value FROM settings ORDER BY rowid");
-  const productRows = db.prepare("SELECT data FROM products ORDER BY position, rowid");
+  const productRows = db.prepare("SELECT id, data FROM products ORDER BY position, rowid");
   const productRow = db.prepare("SELECT data FROM products WHERE id = ?");
+  let reported = "";
 
-  // A damaged row (hand edit, disk error) is left out instead of taking the shop pages down; saving the product again repairs it.
+  // A damaged row (hand edit, disk error) is left out instead of taking the shop pages down. It is neither shown nor editable,
+  // so damaged lists it for the admin page and the log; the fix is a restore from db/backups.
   function current() {
     const settings = {};
+    const damaged = [];
     for (const row of settingRows.all()) {
       const value = parseColumn(row.value, () => true);
       if (value !== undefined) settings[row.key] = value;
+      else damaged.push({ kind: "setting", id: String(row.key) });
     }
     const stock = allStock(db);
     const products = [];
     for (const row of productRows.all()) {
       const product = parseColumn(row.data, (value) => isRecord(value) && typeof value.id === "string");
       if (product) products.push(withStock(product, stock.get(product.id)));
+      else damaged.push({ kind: "product", id: String(row.id) });
     }
-    return { settings, products };
+    // The catalog is read on every page view: the same damage is logged once, not on each visit.
+    const key = JSON.stringify(damaged);
+    if (damaged.length && key !== reported) logger.error("damaged rows were left out of the catalog - restore the database from db/backups", { rows: damaged });
+    reported = key;
+    return damaged.length ? { settings, products, damaged } : { settings, products };
   }
 
   // Visitors see whether a size is on hand, not how many pieces are left.
-  function forVisitors(catalog) {
+  function forVisitors({ damaged, ...catalog }) {
     const products = catalog.products.map((product) =>
       product.stock ? { ...product, stock: Object.fromEntries(Object.entries(product.stock).map(([size, qty]) => [size, qty > 0 ? 1 : 0])) } : product
     );
@@ -189,12 +202,16 @@ export function createCatalog(db) {
       });
     },
 
+    // email is optional: "" removes it from the site; a request without the field keeps the saved one.
     async saveSettings(payload) {
       let whatsapp = String(payload?.whatsapp ?? "").replace(/\D/g, "");
       if (whatsapp.length === 11 && whatsapp.startsWith("8")) whatsapp = `7${whatsapp.slice(1)}`;
       if (whatsapp.length < 10 || whatsapp.length > 15) return { ok: false, error: "invalid" };
+      const email = payload.email === undefined ? undefined : String(payload.email ?? "").trim();
+      if (email && (email.length > 120 || !EMAIL.test(email))) return { ok: false, error: "invalid" };
       return change(() => {
         saveSetting(db, "whatsapp", whatsapp);
+        if (email !== undefined) saveSetting(db, "email", email);
         return "";
       });
     },

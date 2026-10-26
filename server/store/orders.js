@@ -189,13 +189,25 @@ export function createOrders(db, { catalog, paths, logger = silentLogger }) {
     },
 
     async add(payload) {
-      if (!payload || typeof payload !== "object") return 0;
+      // The shop page drops an order the site refused, so the log is the only place left to find it and call the buyer back.
+      const refuse = (reason) => {
+        const lines = Array.isArray(payload?.items) ? payload.items : [];
+        logger.warn("an order was refused", {
+          reason,
+          name: String(payload?.name ?? "").slice(0, 60),
+          phone: String(payload?.phone ?? "").slice(0, 20),
+          items: lines.slice(0, MAX_LINES).map((line) => ({ id: String(line?.id ?? "").slice(0, 40), name: String(line?.name ?? "").slice(0, 80), size: String(line?.size ?? "").slice(0, 80), qty: String(line?.qty ?? "").slice(0, 10) }))
+        });
+        return 0;
+      };
+      if (!payload || typeof payload !== "object") return refuse("payload");
       let name = String(payload.name ?? "").trim().replace(/\s+/g, " ");
       if (name.length > 60) name = name.slice(0, 60);
       let phone = String(payload.phone ?? "").trim();
       if (phone.length > 20) phone = phone.slice(0, 20);
       const digits = phone.replace(/\D/g, "").length;
-      if (name.length < 2 || digits < 10 || digits > 15) return 0;
+      if (name.length < 2) return refuse("name");
+      if (digits < 10 || digits > 15) return refuse("phone");
       // The browser repeats an order it could not confirm; the key lets the repeat find the order already saved.
       const key = ORDER_KEY.test(String(payload.key ?? "")) ? String(payload.key) : "";
 
@@ -210,7 +222,7 @@ export function createOrders(db, { catalog, paths, logger = silentLogger }) {
         items.push(item);
         totals[item.currency] = (totals[item.currency] || 0) + item.price * item.qty;
       }
-      if (!items.length) return 0;
+      if (!items.length) return refuse("items");
 
       const createdAt = localIso();
       const order = { id: shortId(), number: 0, ...(key ? { key } : {}), createdAt, status: "new", name, phone, items, totals, ...filled(cleanBuyer(payload, false)) };

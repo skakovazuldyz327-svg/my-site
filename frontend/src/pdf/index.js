@@ -106,24 +106,30 @@ function framedPhoto(src, frame, mode = "contain") {
 }
 
 // One photo at a time keeps memory low on a phone; onProgress(done, total) lets the button show how far it got.
+// missing: the ids whose photo did not load, so the caller can say the PDF came out without them.
 async function loadPhotos(sources, load, onProgress) {
   const photos = {};
+  const missing = [];
   const entries = [...sources].filter(([, src]) => src);
   let done = 0;
   for (const [id, src] of entries) {
     photos[id] = await load(src);
+    if (!photos[id]) missing.push(id);
     done += 1;
     onProgress?.(done, entries.length);
   }
-  return photos;
+  return { photos, missing };
 }
 
+// Both catalog and order PDFs resolve to { missing }: the names of the products whose photo is left out.
 export async function downloadOrderPdf(order, { whatsapp, products = [], onProgress } = {}) {
   const pdfMake = startLoading();
   const byId = new Map(products.map((product) => [product.id, product]));
-  const sources = new Map((order.items || []).map((line) => [line.id, firstPhoto(byId.get(line.id))]));
-  const photos = await loadPhotos(sources, (src) => photoData(src, 240), onProgress);
+  const lines = order.items || [];
+  const sources = new Map(lines.map((line) => [line.id, firstPhoto(byId.get(line.id))]));
+  const { photos, missing } = await loadPhotos(sources, (src) => photoData(src, 240), onProgress);
   await (await pdfMake).createPdf(orderDoc(order, { whatsapp, photos })).download(orderFileName(order));
+  return { missing: missing.map((id) => byId.get(id)?.name || lines.find((line) => line.id === id)?.name || id) };
 }
 
 // company: the seller's details as saved in the admin (settings.company).
@@ -138,10 +144,13 @@ export async function downloadCatalogPdf(products, { whatsapp, category = "", la
   const list = products.filter((product) => !category || product.category === category);
   const frame = catalogLayout(layout).photo;
   const sources = new Map(list.map((product) => [product.id, firstPhoto(product)]));
-  const [hero, photos] = await Promise.all([
+  const [hero, { photos, missing }] = await Promise.all([
     framedPhoto(COVER_IMAGE, COVER_PHOTO, "cover"),
     loadPhotos(sources, (src) => framedPhoto(src, frame), onProgress)
   ]);
+  if (!hero) console.warn(`catalog PDF: the cover photo ${COVER_IMAGE} did not load`);
   const doc = catalogDoc(list, { whatsapp, photos, hero, category, layout });
   await (await pdfMake).createPdf(doc).download(catalogFileName());
+  const byId = new Map(list.map((product) => [product.id, product]));
+  return { missing: missing.map((id) => byId.get(id)?.name || id) };
 }

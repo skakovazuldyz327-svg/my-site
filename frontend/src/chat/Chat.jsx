@@ -1,6 +1,7 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { CHAT_MAX_FILES, CHAT_MAX_SIZE, chatRequest, fileSize, readAttachment } from "../lib/attachments.js";
 import { CHAT_KEY, askAi, cleanHandoff, loadThread, rulesHistory, saveThread, uploadChatFiles } from "../lib/chatThread.js";
+import { waLink } from "../lib/catalog.js";
 import { askConsultant, consultantHandoff } from "../lib/consultant.js";
 import { storageGet, storageRemove, storageSet } from "../lib/storage.js";
 import { ChatTurn, FileChip } from "./ChatParts.jsx";
@@ -261,7 +262,10 @@ export default function Chat() {
         }
         return askAi(chatRequest(threadRef.current));
       })
-      .catch(() => null)
+      .catch((error) => {
+        console.warn("chat: the AI answer failed, the rules answer is used instead", error);
+        return null;
+      })
       .then((aiAnswer) => {
         let answer = aiAnswer;
         if (!answer && attached.length && !message) {
@@ -277,7 +281,8 @@ export default function Chat() {
         if (!answer) {
           try {
             answer = askConsultant(history);
-          } catch {
+          } catch (error) {
+            console.error("chat: the rules answer failed", error);
             answer = null;
           }
         }
@@ -295,7 +300,24 @@ export default function Chat() {
         remember(item);
         setChips(answer.suggestions || []);
       })
-      .catch(() => {})
+      .catch((error) => {
+        // The visitor must never be left with a message and no answer: the plain WhatsApp link needs nothing that could fail again.
+        console.error("chat: the answer could not be shown", error);
+        const item = {
+          role: "bot",
+          text: "Не получилось показать ответ. Напишите Жулдыз в WhatsApp по кнопке ниже — она ответит лично.",
+          products: [],
+          files: [],
+          handoff: { link: waLink, phone: "", note: "" }
+        };
+        try {
+          remember(item);
+        } catch {
+          threadRef.current = [...threadRef.current, item].slice(-40);
+          setThread(threadRef.current);
+        }
+        setChips([]);
+      })
       .finally(() => {
         busyRef.current = false;
         setBusy(false);

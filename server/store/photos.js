@@ -1,6 +1,8 @@
-import { readdir, readFile, rm, stat } from "node:fs/promises";
+import { readFile, rm } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import { silentLogger } from "../log.js";
+import { listFiles, readdirOrEmpty, statOrMissing } from "./files.js";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
@@ -15,17 +17,6 @@ function databaseText(db) {
   return parts.join("\n");
 }
 
-async function listFiles(dir) {
-  const entries = await readdir(dir, { withFileTypes: true }).catch(() => []);
-  const files = [];
-  for (const entry of entries) {
-    const full = join(dir, entry.name);
-    if (entry.isDirectory()) files.push(...(await listFiles(full)));
-    else if (entry.isFile()) files.push(full);
-  }
-  return files;
-}
-
 // Windows finds a file whatever the letter case, and a link may be URL-encoded: a photo counts as used when its path
 // appears anywhere in any of these forms. A false match only keeps a file, it never deletes one.
 function isMentioned(texts, name) {
@@ -35,7 +26,7 @@ function isMentioned(texts, name) {
 
 // A photo the admin took off every product stays as long as a daily copy or a database set aside by a restore still
 // shows it, so restoring any of them brings the photos back too. A fresh upload stays a day: its product may not be saved yet.
-export function createPhotos(db, paths) {
+export function createPhotos(db, paths, logger = silentLogger) {
   async function savedTexts() {
     const texts = [databaseText(db)];
     for (const file of await listFiles(paths.dist)) {
@@ -43,7 +34,7 @@ export function createPhotos(db, paths) {
     }
     const saved = [
       ...(await listFiles(paths.backups)),
-      ...(await readdir(paths.db, { withFileTypes: true }).catch(() => [])).filter((entry) => entry.isFile()).map((entry) => join(paths.db, entry.name))
+      ...(await readdirOrEmpty(paths.db, { withFileTypes: true })).filter((entry) => entry.isFile()).map((entry) => join(paths.db, entry.name))
     ];
     for (const file of saved) {
       // full-backup-* is the short-lived copy of a zip download, the same data as the live database.
@@ -64,22 +55,30 @@ export function createPhotos(db, paths) {
   }
 
   return {
-    // An unreadable copy throws before anything is deleted.
+    // An unreadable copy or folder throws before anything is deleted; a single photo that is busy is left for the next run.
     async cleanup(now = Date.now()) {
-      const files = await readdir(paths.uploads, { withFileTypes: true }).catch(() => []);
+      const files = await readdirOrEmpty(paths.uploads, { withFileTypes: true });
       const candidates = [];
       for (const entry of files) {
         if (!entry.isFile()) continue;
-        const info = await stat(join(paths.uploads, entry.name)).catch(() => null);
-        if (info && now - info.mtimeMs >= DAY_MS) candidates.push(entry.name);
+        try {
+          const info = await statOrMissing(join(paths.uploads, entry.name));
+          if (info && now - info.mtimeMs >= DAY_MS) candidates.push(entry.name);
+        } catch (error) {
+          logger.warn("a photo was left in place: it could not be checked", { file: entry.name, code: error.code, message: error.message });
+        }
       }
       if (!candidates.length) return [];
       const texts = await savedTexts();
       const removed = [];
       for (const name of candidates) {
         if (isMentioned(texts, name)) continue;
-        await rm(join(paths.uploads, name), { force: true });
-        removed.push(name);
+        try {
+          await rm(join(paths.uploads, name), { force: true });
+          removed.push(name);
+        } catch (error) {
+          logger.warn("a photo no one uses could not be removed", { file: name, code: error.code, message: error.message });
+        }
       }
       return removed;
     }

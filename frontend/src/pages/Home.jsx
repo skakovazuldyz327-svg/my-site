@@ -1,5 +1,5 @@
 import ProductGrid from "../components/ProductGrid.jsx";
-import { products, waLink } from "../lib/catalog.js";
+import { catalogLoaded, contacts, products, waLink } from "../lib/catalog.js";
 import VisitForm from "./VisitForm.jsx";
 
 const stripWords = ["матрасы", "кровати", "подушки", "наматрасники", "основания"];
@@ -133,7 +133,11 @@ export default function Home() {
           <a className="btn btn-ghost" href="products.html">Все товары →</a>
         </header>
         <ProductGrid items={preview} />
-        {!preview.length && <p className="shop-empty">Товары скоро появятся. А пока — просто напишите мне.</p>}
+        {!preview.length && (
+          <p className="shop-empty">
+            {catalogLoaded ? "Товары скоро появятся. А пока — просто напишите мне." : "Не удалось загрузить товары. Обновите страницу или просто напишите мне."}
+          </p>
+        )}
         <div className="shop-more">
           <a className="btn btn-solid" href="products.html">Смотреть все товары ({products.length})</a>
         </div>
@@ -164,11 +168,11 @@ export default function Home() {
             Если удобнее голосом — оставьте телефон, перезвоню в рабочее время.
           </p>
           <address>
-            <a href="tel:+77778492164">+7 (777) 849-21-64</a>
+            <a href={contacts.phoneHref}>{contacts.phone}</a>
             <a href={waLink}>WhatsApp</a>
-            <a href="mailto:zhuldyz.sleep@example.com">zhuldyz.sleep@example.com</a>
+            {contacts.email && <a href={`mailto:${contacts.email}`}>{contacts.email}</a>}
           </address>
-          <p className="hours">Пн–Сб · 10:00–19:00 · вс — по договорённости</p>
+          <p className="hours">{contacts.hours}</p>
         </div>
         <VisitForm />
       </section>

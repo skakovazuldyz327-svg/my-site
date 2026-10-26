@@ -1,9 +1,11 @@
 import { useEffect, useState } from "react";
 import Dialog from "../components/Dialog.jsx";
 import { clampQty, formatPrice } from "../lib/catalog.js";
-import { sendOrder } from "../lib/order.js";
+import { SEND_FAILED, sendOrder } from "../lib/order.js";
 import ClientFields, { useClientForm } from "./ClientFields.jsx";
 import { useShop } from "./ShopContext.jsx";
+
+const ADD_FAILED = "Не получилось добавить в корзину. Отправьте заказ сразу или обновите страницу.";
 
 export default function OrderDialog({ open, order, onClose, onAdded, onSent }) {
   const { addToBag } = useShop();
@@ -11,12 +13,14 @@ export default function OrderDialog({ open, order, onClose, onAdded, onSent }) {
   const [size, setSize] = useState("");
   const [qty, setQty] = useState("1");
   const [seenKey, setSeenKey] = useState(null);
+  const [failure, setFailure] = useState("");
 
   const product = order?.product;
   const sizes = product?.sizes || [];
 
   if (order && order.key !== seenKey) {
     setSeenKey(order.key);
+    setFailure("");
     setSize(sizes.includes(order.size) ? order.size : sizes[0] || "");
     setQty(String(order.qty));
     client.fill();
@@ -28,17 +32,33 @@ export default function OrderDialog({ open, order, onClose, onAdded, onSent }) {
 
   const currentItem = () => ({ id: product.id, size: sizes.length ? size : "", qty: clampQty(qty) });
 
+  // The window closes only after the order went out, so a failure costs the buyer nothing typed.
   const submit = (event) => {
     event.preventDefault();
-    const data = client.validate();
-    if (!data) return;
-    const saved = sendOrder([currentItem()], data);
+    setFailure("");
+    let saved;
+    try {
+      const data = client.validate();
+      if (!data) return;
+      saved = sendOrder([currentItem()], data);
+    } catch (error) {
+      console.error("order failed", error);
+      setFailure(SEND_FAILED);
+      return;
+    }
     onClose();
     onSent(saved);
   };
 
   const add = () => {
-    addToBag(currentItem());
+    setFailure("");
+    try {
+      addToBag(currentItem());
+    } catch (error) {
+      console.error("adding to the bag failed", error);
+      setFailure(ADD_FAILED);
+      return;
+    }
     onAdded();
   };
 
@@ -64,6 +84,7 @@ export default function OrderDialog({ open, order, onClose, onAdded, onSent }) {
           </div>
           <ClientFields form={client} idPrefix="order-client" />
           <p className="order-total">Сумма: <strong>{formatPrice(product.price * clampQty(qty), product)}</strong></p>
+          {failure && <p className="form-error" role="alert">{failure}</p>}
           <button className="btn btn-wa" type="submit">Отправить заказ в WhatsApp</button>
           <button className="btn btn-ghost" type="button" onClick={add}>Добавить в корзину и выбрать ещё</button>
         </form>
