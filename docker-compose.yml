@@ -1,0 +1,57 @@
+# Zhuldyz site in Docker.
+#
+#   docker compose run --rm seed     copy the current db/ and images/ into Docker once (originals are read-only)
+#   docker compose up -d --build     start the site at http://localhost:8080/
+#   docker compose stop              stop it (data stays)
+#
+# Never use "docker compose down -v": -v deletes the volumes with the database and photos.
+
+name: zhuldyz
+
+services:
+  site:
+    build: .
+    image: zhuldyz-site:latest
+    container_name: zhuldyz-site
+    restart: unless-stopped
+    ports:
+      - "8080:8765"
+    env_file:
+      - path: .env
+        required: false
+      - path: docker.env
+        required: false
+    environment:
+      HOST: 0.0.0.0
+      PORT: "8765"
+      # The Windows path from .env means nothing inside Linux
+      BACKUP_COPY_DIR: ""
+    volumes:
+      - zhuldyz-db:/app/db
+      - zhuldyz-images:/app/images
+
+  # One-off: fills the empty Docker volumes with a copy of the current data. Refuses if a database is already there.
+  seed:
+    profiles: ["seed"]
+    image: zhuldyz-site:latest
+    build: .
+    user: root
+    volumes:
+      - ./db:/from/db:ro
+      - ./images:/from/images:ro
+      - zhuldyz-db:/app/db
+      - zhuldyz-images:/app/images
+    command:
+      - sh
+      - -c
+      - |
+        if [ -e /app/db/zhuldyz.sqlite ]; then
+          echo "Docker already has a database - nothing was copied."; exit 1
+        fi
+        cp -a /from/db/. /app/db/ && cp -a /from/images/. /app/images/ &&
+        chown -R node:node /app/db /app/images &&
+        echo "Copied: $$(ls /app/images/products | wc -l) photos, database $$(du -h /app/db/zhuldyz.sqlite | cut -f1)"
+
+volumes:
+  zhuldyz-db:
+  zhuldyz-images:

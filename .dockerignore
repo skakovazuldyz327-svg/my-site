@@ -1,0 +1,18 @@
+# Secrets and personal data never go into the image
+.env
+docker.env
+db/
+images/products/
+server-log.txt
+server-log.txt.old
+
+# Rebuilt inside the image
+frontend/node_modules/
+dist/
+
+# Windows-only tools and history
+.tools/
+.git/
+.cursor/
+*.bat
+tests/
