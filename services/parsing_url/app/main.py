@@ -69,6 +69,10 @@ class CrawlerHolder:
                 logger.info("Browser started")
         return self._crawler
 
+    @property
+    def running(self) -> bool:
+        return self._crawler is not None
+
     def _is_alive(self) -> bool:
         manager = getattr(getattr(self._crawler, "crawler_strategy", None), "browser_manager", None)
         browser = getattr(manager, "browser", None)
@@ -98,7 +102,10 @@ api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 
 
 def require_api_key(key: Optional[str] = Security(api_key_header)) -> None:
-    if API_KEY and not (key and secrets.compare_digest(key, API_KEY)):
+    # Headers arrive latin-1 decoded and compare_digest rejects non-ASCII str, so compare raw bytes.
+    if API_KEY and not (
+        key and secrets.compare_digest(key.encode("latin-1", "replace"), API_KEY.encode("utf-8"))
+    ):
         raise HTTPException(status_code=401, detail="Invalid or missing X-API-Key")
 
 
@@ -131,15 +138,32 @@ async def _warmup() -> None:
             await asyncio.sleep(WARMUP_RETRY_S)
 
 
+_warmup_task: Optional[asyncio.Task] = None
+
+
+def ensure_warmup() -> None:
+    global _warmup_task
+    if _warmup_task is None or _warmup_task.done():
+        _warmup_task = asyncio.create_task(_warmup())
+
+
+async def recover_browser() -> None:
+    """After a failed request: drop a dead browser and keep starting a new one in the background."""
+    await crawler_holder.reset_if_dead()
+    if not crawler_holder.running:
+        ensure_warmup()
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    warmup_task = asyncio.create_task(_warmup())
+    ensure_warmup()
     try:
         yield
     finally:
-        warmup_task.cancel()
-        with suppress(asyncio.CancelledError):
-            await warmup_task
+        if _warmup_task is not None:
+            _warmup_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await _warmup_task
         await crawler_holder.close()
 
 
@@ -185,23 +209,25 @@ async def parse(body: ParseRequest) -> ParseResponse:
         return ParseResponse(success=False, url=url, error_message=str(exc))
     except asyncio.TimeoutError:
         logger.warning("Request timed out for %s", url)
-        await crawler_holder.reset_if_dead()
+        await recover_browser()
         return ParseResponse(
             success=False, url=url, error_message=f"Request timed out after {REQUEST_TIMEOUT_S:.0f}s"
         )
     except Exception as exc:
         logger.exception("Crawl failed for %s", url)
-        await crawler_holder.reset_if_dead()
+        await recover_browser()
         return ParseResponse(success=False, url=url, error_message=str(exc))
 
     markdown = result.markdown
     if markdown is not None:
         markdown = getattr(markdown, "raw_markdown", None) or str(markdown)
 
+    success = bool(result.success)
     return ParseResponse(
-        success=bool(result.success),
+        success=success,
         url=url,
         markdown=markdown,
         cleaned_html=result.cleaned_html,
-        error_message=result.error_message,
+        # crawl4ai reports "" on success; the API contract is null.
+        error_message=result.error_message or (None if success else "Crawl failed"),
     )

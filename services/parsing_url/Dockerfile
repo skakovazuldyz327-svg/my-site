@@ -27,9 +27,9 @@ USER app
 
 # The first Chromium launch builds the fontconfig cache, which can exceed Playwright's
 # 3-minute launch timeout on slow hosts; doing it at build time keeps container starts fast.
+# Best effort: a failed warmup only means a slower first start, so it never fails the build.
 RUN timeout 600 /ms-playwright/chromium_headless_shell-*/chrome-headless-shell-linux64/chrome-headless-shell \
-        --no-sandbox --disable-gpu --disable-dev-shm-usage --dump-dom about:blank >/dev/null 2>&1; \
-    ls /home/app/.cache/fontconfig >/dev/null
+        --no-sandbox --disable-gpu --disable-dev-shm-usage --dump-dom about:blank >/dev/null 2>&1 || true
 
 COPY --chown=app:app app ./app
 
