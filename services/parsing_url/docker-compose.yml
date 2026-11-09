@@ -1,0 +1,26 @@
+services:
+  crawl4ai-api:
+    build: .
+    image: crawl4ai-service:latest
+    container_name: crawl4ai-api
+    ports:
+      # Only reachable from this machine; use "8000:8000" to expose it to the network (set API_KEY then).
+      - "127.0.0.1:8000:8000"
+    environment:
+      MAX_CONCURRENCY: "2"
+      PAGE_TIMEOUT_MS: "60000"
+      REQUEST_TIMEOUT_S: "240"
+      API_KEY: "${API_KEY:-}"
+      ALLOW_PRIVATE_URLS: "false"
+      LOG_LEVEL: "INFO"
+      CRAWL4AI_NO_CLOUD_NOTICE: "1"
+    init: true
+    mem_limit: 2g
+    shm_size: "512m"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import json,sys,urllib.request; r=json.load(urllib.request.urlopen('http://localhost:8000/health', timeout=5)); sys.exit(1 if r.get('browser') == 'error' else 0)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
