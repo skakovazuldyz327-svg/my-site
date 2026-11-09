@@ -11,10 +11,10 @@ import { createStore } from "../server/store/index.js";
 import { fakeProvider, replyCall, tempSite } from "./helpers.js";
 
 const site = tempSite();
-const store = createStore(site.config);
-after(() => {
-  store.close();
-  site.cleanup();
+const store = await createStore(site.config);
+after(async () => {
+  await store.close();
+  await site.cleanup();
 });
 
 const user = (text, extra = {}) => ({ messages: [{ role: "user", text, ...extra }] });

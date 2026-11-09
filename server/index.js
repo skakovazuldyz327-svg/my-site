@@ -5,6 +5,7 @@ import { createApp } from "./app.js";
 import { DEFAULT_ADMIN_PASSWORD, loadConfig } from "./config.js";
 import { holdFolder } from "./instance.js";
 import { createLogger } from "./log.js";
+import { DatabaseUnreachableError, NewDatabaseRefusedError } from "./store/db.js";
 import { createStore } from "./store/index.js";
 import { listBackups } from "./store/restore.js";
 
@@ -20,30 +21,33 @@ if (!(await holdFolder(config.root))) {
   process.exit(2);
 }
 
-// A missing database file would be made anew with order numbers from 1, giving out numbers clients already have.
-// With earlier data around that is an accident (moved file, broken restore), so the site waits for the owner instead.
-if (!existsSync(config.paths.database) && !process.argv.includes("--new-database")) {
-  let earlier = [];
+// An empty database would start order numbers from 1, giving out numbers clients already have. With earlier data around
+// that is an accident (a lost Docker volume, a wrong POSTGRES_DB), so the site waits for the owner instead.
+let earlier = [];
+function mayCreate() {
+  if (process.argv.includes("--new-database") || existsSync(config.paths.sqlite)) return true;
   try {
     earlier = [
-      ...readdirSync(config.paths.db).filter((name) => /^before-restore-.+\.sqlite$|^zhuldyz\.sqlite\.tmp$/.test(name)),
+      ...readdirSync(config.paths.db).filter((name) => /^before-restore-.+\.(json|sqlite)$|^zhuldyz-before-postgres.*\.sqlite$/.test(name)),
       ...listBackups(config.paths).map((backup) => `backups/${backup.day}`)
     ];
   } catch (error) {
     if (error.code !== "ENOENT") earlier = [`earlier data could not be checked: ${error.message}`];
   }
-  if (earlier.length) {
-    logger.error("db/zhuldyz.sqlite is missing but earlier data exists - the site was not started so order numbers are not given out again; put the file back or run restore-backup.bat, or start with --new-database to begin an empty one", { found: earlier.slice(0, 10) });
-    await logger.flush();
-    process.exit(2);
-  }
+  return !earlier.length;
 }
 
 let store;
 try {
-  store = createStore(config, logger);
+  store = await createStore(config, logger, { mayCreate });
 } catch (error) {
-  logger.error("the database could not be opened or the old data could not be moved into it - nothing was changed; restore db/zhuldyz.sqlite from db/backups or fix the file named here", { message: String(error?.stack || error) });
+  if (error instanceof NewDatabaseRefusedError) {
+    logger.error(`${error.message} but earlier data exists - the site was not started so order numbers are not given out again; run restore-backup.bat, or start with --new-database to begin an empty one`, { found: earlier.slice(0, 10) });
+  } else if (error instanceof DatabaseUnreachableError) {
+    logger.error(error.message);
+  } else {
+    logger.error("the database could not be opened or the old data could not be moved into it - nothing was changed; run restore-backup.bat or fix the file named here", { message: String(error?.stack || error) });
+  }
   await logger.flush();
   process.exit(2);
 }

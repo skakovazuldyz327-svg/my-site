@@ -13,7 +13,7 @@ import { createZip } from "../server/store/zip.js";
 import { fakeProvider, replyCall, tempSite } from "./helpers.js";
 
 const site = tempSite();
-const store = createStore(site.config);
+const store = await createStore(site.config);
 const reader = createFileReader({ store });
 const SESSION = "visitor0001";
 
@@ -220,7 +220,7 @@ test("too big and empty files are described, not sent", async () => {
   const [blank] = await ask([ref(empty)]);
   assert.equal(blank.status, "empty");
   const { insertChatFile } = await import("../server/store/chatFiles.js");
-  insertChatFile(store.db, { ...big, session: SESSION, text: "", time: Date.now() });
+  await insertChatFile(store.db, { ...big, session: SESSION, text: "", time: Date.now() });
   const [huge] = await ask([big]);
   assert.equal(huge.status, "too-big");
   assert.equal(huge.data, undefined);
@@ -238,10 +238,10 @@ function describeUploadAndChat() {
     base = `http://127.0.0.1:${server.address().port}`;
     resolve();
   })));
-  after(() => {
+  after(async () => {
     server.close();
-    store.close();
-    site.cleanup();
+    await store.close();
+    await site.cleanup();
   });
 
   const upload = async (name, type, body) => {

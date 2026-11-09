@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { inflateRawSync } from "node:zlib";
 import { after, test } from "node:test";
+import { DUMP_FORMAT, NewDatabaseRefusedError, openDatabase } from "../server/store/db.js";
 import { localIso, readdirOrEmpty, statOrMissing } from "../server/store/files.js";
 import { createStore } from "../server/store/index.js";
 import { LegacyFileError } from "../server/store/legacy.js";
@@ -11,11 +12,14 @@ import { CounterUnreadableError, listBackups, restoreBackup } from "../server/st
 import { tempSite } from "./helpers.js";
 
 const site = tempSite();
-const store = createStore(site.config);
-after(() => {
-  store.close();
-  site.cleanup();
+const store = await createStore(site.config);
+after(async () => {
+  await store.close();
+  await site.cleanup();
 });
+
+const readJson = (file) => JSON.parse(readFileSync(file, "utf8"));
+const openForRestore = (config) => openDatabase(config.database, { application: "zhuldyz-restore" });
 
 const order = (extra = {}) => ({ name: "Айгуль", phone: "8 777 123 45 67", items: [{ id: "pmuwtba7c", size: "160×200", qty: 2 }], ...extra });
 const today = () => {
@@ -88,12 +92,12 @@ test("damaged catalog rows are listed for the admin and logged once, but not sho
   withSite(null, async (other) => {
     const errors = [];
     const logger = { info() {}, warn() {}, error: (message, data) => errors.push({ message, data }) };
-    const shop = createStore(other.config, logger);
+    const shop = await createStore(other.config, logger);
     try {
       const [first, second] = (await shop.catalog.read()).products;
       assert.equal("damaged" in (await shop.catalog.read()), false);
-      shop.db.prepare("UPDATE products SET data = '{broken' WHERE id = ?").run(first.id);
-      shop.db.prepare("UPDATE settings SET value = '{broken' WHERE key = 'whatsapp'").run();
+      await shop.db.run("UPDATE products SET data = '{broken' WHERE id = $1", [first.id]);
+      await shop.db.run("UPDATE settings SET value = '{broken' WHERE key = 'whatsapp'");
       const catalog = await shop.catalog.read();
       assert.deepEqual(catalog.damaged, [{ kind: "setting", id: "whatsapp" }, { kind: "product", id: first.id }]);
       assert.equal(catalog.products[0].id, second.id);
@@ -104,11 +108,11 @@ test("damaged catalog rows are listed for the admin and logged once, but not sho
       const logged = errors.filter((entry) => entry.message.startsWith("damaged rows"));
       assert.equal(logged.length, 1);
       assert.deepEqual(logged[0].data.rows, catalog.damaged);
-      shop.db.prepare("UPDATE products SET data = ? WHERE id = ?").run(JSON.stringify(first), first.id);
-      shop.db.prepare("UPDATE settings SET value = ? WHERE key = 'whatsapp'").run(JSON.stringify("77001234567"));
+      await shop.db.run("UPDATE products SET data = $1 WHERE id = $2", [JSON.stringify(first), first.id]);
+      await shop.db.run("UPDATE settings SET value = $1 WHERE key = 'whatsapp'", [JSON.stringify("77001234567")]);
       assert.equal("damaged" in (await shop.catalog.read()), false);
     } finally {
-      shop.close();
+      await shop.close();
     }
   }));
 
@@ -116,7 +120,7 @@ test("a refused order is logged with the reason and the buyer's details", () =>
   withSite(null, async (other) => {
     const warnings = [];
     const logger = { info() {}, error() {}, warn: (message, data) => warnings.push({ message, data }) };
-    const shop = createStore(other.config, logger);
+    const shop = await createStore(other.config, logger);
     try {
       await shop.orders.add(order({ name: "A" }));
       await shop.orders.add(order({ phone: "123" }));
@@ -129,7 +133,7 @@ test("a refused order is logged with the reason and the buyer's details", () =>
       assert.deepEqual(refused[2].data.items, [{ id: "nope", name: "", size: "90×200", qty: "1" }]);
       assert.equal(await shop.orders.add(order()), 1);
     } finally {
-      shop.close();
+      await shop.close();
     }
   }));
 
@@ -213,37 +217,32 @@ test("two admin windows do not erase each other's catalog changes", async () => 
 
 test("daily backup is a full database copy, taken once per day", async () => {
   await store.backups.daily();
-  const file = join(site.config.paths.backups, today(), "zhuldyz.sqlite");
-  const copy = new DatabaseSync(file, { readOnly: true });
-  try {
-    assert.equal(copy.prepare("SELECT COUNT(*) AS count FROM orders").get().count, (await store.orders.read()).length);
-  } finally {
-    copy.close();
-  }
+  const file = join(site.config.paths.backups, today(), "zhuldyz.json");
+  const copy = readJson(file);
+  assert.equal(copy.format, DUMP_FORMAT);
+  assert.equal(copy.tables.orders.length, (await store.orders.read()).length);
+  assert.equal(copy.tables.products.length, (await store.catalog.read()).products.length);
   await store.orders.add(order());
   await store.backups.daily();
-  const again = new DatabaseSync(file, { readOnly: true });
-  try {
-    assert.equal(again.prepare("SELECT COUNT(*) AS count FROM orders").get().count, (await store.orders.read()).length - 1);
-  } finally {
-    again.close();
-  }
+  assert.equal(readJson(file).tables.orders.length, (await store.orders.read()).length - 1);
+  assert.equal(existsSync(`${file}.tmp`), false);
 });
+
+test("with the database down the daily copy reports the failure once, not on every request", () =>
+  withSite(null, async (other) => {
+    const shop = await createStore(other.config);
+    await shop.db.close();
+    await assert.rejects(shop.backups.daily());
+    await shop.backups.daily();
+    assert.equal(existsSync(join(other.config.paths.backups, today(), "zhuldyz.json")), false);
+  }));
 
 test("a copy outside the site folder holds a fresh database and every photo; older days are dropped, photos are kept", () =>
   withSite(null, async (other) => {
     const outside = join(other.root, "OneDrive", "Zhuldyz-backups");
-    const count = (file) => {
-      const copy = new DatabaseSync(file, { readOnly: true });
-      try {
-        assert.equal(copy.prepare("PRAGMA integrity_check").get().integrity_check, "ok");
-        return copy.prepare("SELECT COUNT(*) AS count FROM orders").get().count;
-      } finally {
-        copy.close();
-      }
-    };
+    const count = (file) => readJson(file).tables.orders.length;
     writeFileSync(join(other.config.paths.uploads, "a.jpg"), "photo");
-    const shop = createStore(other.config);
+    const shop = await createStore(other.config);
     try {
       assert.equal(await shop.backups.offsite(), null);
       other.config.backupCopyDir = outside;
@@ -255,16 +254,19 @@ test("a copy outside the site folder holds a fresh database and every photo; old
       assert.equal(readFileSync(join(outside, "images", "products", "a.jpg"), "utf8"), "photo");
 
       await shop.orders.add(order());
-      for (const day of ["2020-01-01", "2020-01-02"]) writeFileSync(join(outside, "db", `zhuldyz-${day}.sqlite`), "");
+      // Copies from the SQLite days age out with the new ones.
+      writeFileSync(join(outside, "db", "zhuldyz-2020-01-01.sqlite"), "");
+      writeFileSync(join(outside, "db", "zhuldyz-2020-01-02.json"), "");
+      writeFileSync(join(outside, "db", "zhuldyz-2020-01-03.sqlite"), "");
       rmSync(join(other.config.paths.uploads, "a.jpg"));
       const second = await shop.backups.offsite();
       assert.equal(second.file, first.file);
       assert.equal(second.photos, 0);
       assert.equal(count(second.file), 2);
-      assert.deepEqual(readdirSync(join(outside, "db")).sort(), ["zhuldyz-2020-01-02.sqlite", first.file.split(/[\\/]/).pop()]);
+      assert.deepEqual(readdirSync(join(outside, "db")).sort(), ["zhuldyz-2020-01-03.sqlite", first.file.split(/[\\/]/).pop()]);
       assert.ok(existsSync(join(outside, "images", "products", "a.jpg")));
     } finally {
-      shop.close();
+      await shop.close();
     }
   }));
 
@@ -274,9 +276,10 @@ test("backup zip holds the database, readable JSON exports and the photos", asyn
   assert.equal(zip.readUInt32LE(0), 0x04034b50);
   const nameLength = zip.readUInt16LE(26);
   const packedSize = zip.readUInt32LE(18);
-  assert.equal(zip.subarray(30, 30 + nameLength).toString("utf8"), "db/zhuldyz.sqlite");
-  const database = inflateRawSync(zip.subarray(30 + nameLength, 30 + nameLength + packedSize));
-  assert.equal(database.subarray(0, 15).toString(), "SQLite format 3");
+  assert.equal(zip.subarray(30, 30 + nameLength).toString("utf8"), "db/zhuldyz.json");
+  const database = JSON.parse(inflateRawSync(zip.subarray(30 + nameLength, 30 + nameLength + packedSize)).toString("utf8"));
+  assert.equal(database.format, DUMP_FORMAT);
+  assert.equal(database.tables.orders.length, (await store.orders.read()).length);
   for (const name of ["export/products.json", "export/orders.json", "export/clients.json"]) assert.ok(zip.includes(Buffer.from(name)));
   const photoName = zip.indexOf(Buffer.from("images/products/фото.jpg", "utf8"));
   const photoHeader = photoName - 30;
@@ -387,16 +390,16 @@ test("the seller's requisites are checked, normalised and saved with the setting
 
 test("everything survives a restart", () =>
   withSite(null, async (other) => {
-    const first = createStore(other.config);
+    const first = await createStore(other.config);
     const number = await first.orders.add(order({ key: "k-restart-0001" }));
     const [client] = await first.clients.read();
     await first.clients.setHidden({ id: client.id, hidden: true });
     const { products } = await first.catalog.read();
     await first.catalog.saveProduct({ product: { ...products[1], price: 4321 }, base: products[1] });
     await first.orders.remove({ id: (await first.orders.read())[0].id });
-    first.close();
+    await first.close();
 
-    const second = createStore(other.config);
+    const second = await createStore(other.config);
     try {
       assert.deepEqual(await second.orders.read(), []);
       assert.equal(await second.orders.add(order({ key: "k-restart-0001" })), number);
@@ -406,7 +409,7 @@ test("everything survives a restart", () =>
       assert.equal(catalog.products[1].price, 4321);
       assert.equal(catalog.products.length, products.length);
     } finally {
-      second.close();
+      await second.close();
     }
   }));
 
@@ -425,7 +428,7 @@ test("all data of the old version is moved into the database: numbers, counter, 
     writeJson(`${legacy.clients}.bak`, [{ id: "c1", name: "Айгуль", phone: "77771234567", createdAt: "2025-12-01T10:00:00.0000000+05:00", lastOrderAt: "2026-01-01T10:00:00.0000000+05:00", hidden: true, vip: 1 }]);
     writeJson(legacy.chatFilesIndex, [{ id: "f1", name: "анализ.pdf", type: "application/pdf", size: 3, session: "s1", text: "текст", createdAt: localIso(), time: Date.now() }]);
   }, async (other) => {
-    const moved = createStore(other.config);
+    const moved = await createStore(other.config);
     try {
       const orders = await moved.orders.read();
       assert.deepEqual(orders.map((entry) => [entry.id, entry.number]), [["o1", 8], ["o2", 9], ["o3", 13]]);
@@ -448,7 +451,7 @@ test("all data of the old version is moved into the database: numbers, counter, 
       const archived = readdirSync(join(other.config.paths.legacyArchive, stamp)).sort();
       assert.deepEqual(archived, ["chat-files.json", "clients.json", "clients.json.bak", "deleted-orders.json", "last-order-number.txt", "orders.json", "products.json"]);
     } finally {
-      moved.close();
+      await moved.close();
     }
   }));
 
@@ -457,29 +460,29 @@ test("a damaged old file without a readable copy stops the start and imports not
     writeJson(other.config.paths.legacy.orders, [{ id: "o1", number: 1, name: "Айгуль", phone: "87771234567" }]);
     writeFileSync(other.config.paths.legacy.clients, "");
   }, async (other) => {
-    assert.throws(() => createStore(other.config), LegacyFileError);
+    await assert.rejects(createStore(other.config), LegacyFileError);
     assert.ok(existsSync(other.config.paths.legacy.orders));
     writeJson(other.config.paths.legacy.clients, []);
-    const fixed = createStore(other.config);
+    const fixed = await createStore(other.config);
     try {
       assert.equal((await fixed.orders.read()).length, 1);
       assert.equal(existsSync(other.config.paths.legacy.orders), false);
     } finally {
-      fixed.close();
+      await fixed.close();
     }
   }));
 
 test("an order the database refused is kept in the rescue file and moved in on the next start", () =>
   withSite(null, async (other) => {
-    const first = createStore(other.config);
+    const first = await createStore(other.config);
     const saved = await first.orders.add(order());
-    first.db.close();
+    await first.db.close();
     const rescued = await first.orders.add(order({ name: "Ерлан", phone: "+7 701 555 22 11" }));
     assert.equal(rescued, saved + 1);
     const line = JSON.parse(readFileSync(other.config.paths.ordersRescue, "utf8").trim());
     assert.equal(line.name, "Ерлан");
 
-    const second = createStore(other.config);
+    const second = await createStore(other.config);
     try {
       const orders = await second.orders.read();
       assert.deepEqual(orders.map((entry) => entry.number), [saved, rescued]);
@@ -487,34 +490,35 @@ test("an order the database refused is kept in the rescue file and moved in on t
       assert.equal(existsSync(other.config.paths.ordersRescue), false);
       assert.equal(await second.orders.add(order()), rescued + 1);
     } finally {
-      second.close();
+      await second.close();
     }
   }));
 
 test("after a brief refusal of the database the next order does not reuse the number of the rescued one", () =>
   withSite(null, async (other) => {
-    const first = createStore(other.config);
+    const first = await createStore(other.config);
     const saved = await first.orders.add(order());
-    first.db.exec("CREATE TRIGGER refuse BEFORE INSERT ON orders BEGIN SELECT RAISE(ABORT, 'disk I/O error'); END;");
+    await first.db.query(`CREATE FUNCTION refuse() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'disk I/O error'; END $$;
+      CREATE TRIGGER refuse BEFORE INSERT ON orders FOR EACH ROW EXECUTE FUNCTION refuse();`);
     const rescued = await first.orders.add(order({ name: "Ерлан", phone: "+7 701 555 22 11" }));
-    first.db.exec("DROP TRIGGER refuse");
+    await first.db.query("DROP TRIGGER refuse ON orders");
     const next = await first.orders.add(order({ name: "Дина", phone: "+7 702 555 33 44" }));
     assert.deepEqual([saved, rescued, next], [saved, saved + 1, saved + 2]);
-    first.close();
+    await first.close();
 
-    const second = createStore(other.config);
+    const second = await createStore(other.config);
     try {
       const orders = await second.orders.read();
       assert.deepEqual(orders.map((entry) => [entry.number, entry.name]), [[saved, "Айгуль"], [rescued, "Ерлан"], [next, "Дина"]]);
       assert.equal(await second.orders.add(order()), next + 1);
     } finally {
-      second.close();
+      await second.close();
     }
   }));
 
 test("a product edit with stock status is stored exactly, survives a restart and reaches the shop script", () =>
   withSite(null, async (other) => {
-    const first = createStore(other.config);
+    const first = await createStore(other.config);
     const { products } = await first.catalog.read();
     const base = products.find((product) => product.inStock);
     const edited = {
@@ -540,9 +544,9 @@ test("a product edit with stock status is stored exactly, survives a restart and
     assert.equal(back.ok, true);
     const again = back.catalog.products.find((product) => product.id === base.id);
     assert.equal((await first.catalog.saveProduct({ product: { ...again, inStock: false }, base: again })).ok, true);
-    first.close();
+    await first.close();
 
-    const second = createStore(other.config);
+    const second = await createStore(other.config);
     try {
       const product = (await second.catalog.read()).products.find((entry) => entry.id === base.id);
       assert.deepEqual(product, expected);
@@ -550,7 +554,7 @@ test("a product edit with stock status is stored exactly, survives a restart and
       const page = JSON.parse((await second.catalog.page()).slice("window.SITE_DATA = ".length, -2));
       assert.equal(page.products.find((entry) => entry.id === base.id).inStock, false);
     } finally {
-      second.close();
+      await second.close();
     }
   }));
 
@@ -575,7 +579,7 @@ test("a product with a broken price is refused and a missing stock mark is store
 
 test("counted stock: an order takes pieces when taken into work, a shortage is made to order, cancel and delete give them back", () =>
   withSite(null, async (other) => {
-    const shop = createStore(other.config);
+    const shop = await createStore(other.config);
     try {
       const id = "pmuwtba7c";
       const stockNow = async () => (await shop.catalog.read()).products.find((product) => product.id === id);
@@ -630,14 +634,14 @@ test("counted stock: an order takes pieces when taken into work, a shortage is m
       assert.ok(await shop.orders.setStatus({ id: (await byNumber(third)).id, status: "work" }));
       assert.equal((await byNumber(third)).items[0].fromStock, undefined);
     } finally {
-      shop.close();
+      await shop.close();
     }
   }));
 
 test("an admin stock change is added to what orders left, survives a restart and can be switched off", () =>
   withSite(null, async (other) => {
     const id = "pmuwtba7c";
-    const first = createStore(other.config);
+    const first = await createStore(other.config);
     const read = async (store) => (await store.catalog.read()).products.find((product) => product.id === id);
     const base = await read(first);
     await first.catalog.saveProduct({ product: { ...base, stock: { "90×200": 1, "160×200": 3, "180×200": 0 } }, base });
@@ -652,9 +656,9 @@ test("an admin stock change is added to what orders left, survives a restart and
     assert.equal((await read(first)).price, 199000);
     const broken = await first.catalog.saveProduct({ product: { ...(await read(first)), stock: { "160×200": -1 } }, base: await read(first) });
     assert.equal(broken.error, "invalid");
-    first.close();
+    await first.close();
 
-    const second = createStore(other.config);
+    const second = await createStore(other.config);
     try {
       const after = await read(second);
       assert.deepEqual(after.stock, { "90×200": 1, "160×200": 4, "180×200": 0 });
@@ -666,21 +670,21 @@ test("an admin stock change is added to what orders left, survives a restart and
       const number = await second.orders.add(order({ items: [{ id, size: "160×200", qty: 1 }] }));
       assert.equal((await second.orders.read()).find((entry) => entry.number === number).items[0].fromStock, undefined);
       await second.catalog.removeProduct({ id });
-      assert.equal(second.db.prepare("SELECT COUNT(*) AS count FROM stock").get().count, 0);
+      assert.equal((await second.db.one("SELECT COUNT(*) AS count FROM stock")).count, 0);
     } finally {
-      second.close();
+      await second.close();
     }
   }));
 
 test("a rescued order is moved in as new and takes its stock only when taken into work", () =>
   withSite(null, async (other) => {
     const id = "pmuwtba7c";
-    const first = createStore(other.config);
+    const first = await createStore(other.config);
     const base = (await first.catalog.read()).products.find((product) => product.id === id);
     await first.catalog.saveProduct({ product: { ...base, stock: { "160×200": 2 } }, base });
-    first.db.close();
+    await first.db.close();
     await first.orders.add(order({ items: [{ id, size: "160×200", qty: 1 }] }));
-    const second = createStore(other.config);
+    const second = await createStore(other.config);
     const onHand = async () => (await second.catalog.read()).products.find((product) => product.id === id).stock["160×200"];
     try {
       const [rescued] = await second.orders.read();
@@ -689,13 +693,13 @@ test("a rescued order is moved in as new and takes its stock only when taken int
       assert.ok(await second.orders.setStatus({ id: rescued.id, status: "work" }));
       assert.equal(await onHand(), 1);
     } finally {
-      second.close();
+      await second.close();
     }
   }));
 
 test("a flood of anonymous orders does not touch the stock", () =>
   withSite(null, async (other) => {
-    const shop = createStore(other.config);
+    const shop = await createStore(other.config);
     try {
       const id = "pmuwtba7c";
       const base = (await shop.catalog.read()).products.find((product) => product.id === id);
@@ -706,28 +710,28 @@ test("a flood of anonymous orders does not touch the stock", () =>
       assert.equal(after.stock["160×200"], 5);
       assert.equal(after.inStock, true);
     } finally {
-      shop.close();
+      await shop.close();
     }
   }));
 
 test("a new order saved before stock waited for work still gives its pieces back on cancel and delete", () =>
   withSite(null, async (other) => {
-    const shop = createStore(other.config);
+    const shop = await createStore(other.config);
     try {
       const id = "pmuwtba7c";
       const onHand = async () => (await shop.catalog.read()).products.find((product) => product.id === id).stock["160×200"];
       const base = (await shop.catalog.read()).products.find((product) => product.id === id);
       await shop.catalog.saveProduct({ product: { ...base, stock: { "160×200": 4 } }, base });
-      const holdOld = (orderId, taken) => {
-        const items = JSON.parse(shop.db.prepare("SELECT items FROM orders WHERE id = ?").get(orderId).items).map((item) => ({ ...item, fromStock: taken }));
-        shop.db.prepare("UPDATE orders SET items = ? WHERE id = ?").run(JSON.stringify(items), orderId);
-        shop.db.prepare("UPDATE stock SET qty = qty - ? WHERE product_id = ? AND size = '160×200'").run(taken, id);
+      const holdOld = async (orderId, taken) => {
+        const items = JSON.parse((await shop.db.one("SELECT items FROM orders WHERE id = $1", [orderId])).items).map((item) => ({ ...item, fromStock: taken }));
+        await shop.db.run("UPDATE orders SET items = $1 WHERE id = $2", [JSON.stringify(items), orderId]);
+        await shop.db.run("UPDATE stock SET qty = qty - $1 WHERE product_id = $2 AND size = '160×200'", [taken, id]);
       };
       await shop.orders.add(order({ items: [{ id, size: "160×200", qty: 2 }] }));
       await shop.orders.add(order({ items: [{ id, size: "160×200", qty: 1 }] }));
       const [cancelled, deleted] = await shop.orders.read();
-      holdOld(cancelled.id, 2);
-      holdOld(deleted.id, 1);
+      await holdOld(cancelled.id, 2);
+      await holdOld(deleted.id, 1);
       assert.equal(await onHand(), 1);
 
       assert.ok(await shop.orders.setStatus({ id: cancelled.id, status: "work" }));
@@ -739,22 +743,22 @@ test("a new order saved before stock waited for work still gives its pieces back
       assert.ok(await shop.orders.remove({ id: deleted.id }));
       assert.equal(await onHand(), 4);
     } finally {
-      shop.close();
+      await shop.close();
     }
   }));
 
 test("one damaged row does not stop the lists or the shop page; the rest of the record is kept for a repair", () =>
   withSite(null, async (other) => {
-    const shop = createStore(other.config);
+    const shop = await createStore(other.config);
     try {
       const good = await shop.orders.add(order());
       const bad = await shop.orders.add(order({ name: "Ерлан", phone: "+7 701 555 22 11", company: "ТОО «Ромашка»" }));
       const badId = (await shop.orders.read()).find((entry) => entry.number === bad).id;
-      shop.db.prepare("UPDATE orders SET items = '[{broken', extra = '{broken' WHERE id = ?").run(badId);
-      shop.db.prepare("UPDATE clients SET extra = '{broken' WHERE phone = '77015552211'").run();
+      await shop.db.run("UPDATE orders SET items = '[{broken', extra = '{broken' WHERE id = $1", [badId]);
+      await shop.db.run("UPDATE clients SET extra = '{broken' WHERE phone = '77015552211'");
       const { products } = await shop.catalog.read();
-      shop.db.prepare("UPDATE products SET data = '{broken' WHERE id = ?").run(products[0].id);
-      shop.db.prepare("INSERT INTO settings (key, value) VALUES ('broken', '{broken')").run();
+      await shop.db.run("UPDATE products SET data = '{broken' WHERE id = $1", [products[0].id]);
+      await shop.db.run("INSERT INTO settings (key, value) VALUES ('broken', '{broken')");
 
       const orders = await shop.orders.read();
       assert.deepEqual(orders.map((entry) => [entry.number, Boolean(entry.damaged)]), [[good, false], [bad, true]]);
@@ -768,7 +772,7 @@ test("one damaged row does not stop the lists or the shop page; the rest of the 
 
       assert.ok(await shop.orders.setStatus({ id: badId, status: "work" }));
       assert.equal(await shop.orders.setBuyer({ id: badId, company: "Другая" }), false);
-      const row = shop.db.prepare("SELECT status, items, extra FROM orders WHERE id = ?").get(badId);
+      const row = await shop.db.one("SELECT status, items, extra FROM orders WHERE id = $1", [badId]);
       assert.deepEqual({ ...row }, { status: "work", items: "[{broken", extra: "{broken" });
       assert.ok(await shop.orders.remove({ id: badId }));
 
@@ -776,13 +780,13 @@ test("one damaged row does not stop the lists or the shop page; the rest of the 
       assert.equal(repaired.ok, true);
       assert.equal((await shop.catalog.read()).products.length, products.length);
     } finally {
-      shop.close();
+      await shop.close();
     }
   }));
 
 test("visitors see whether a size is on hand, the admin sees the counts", () =>
   withSite(null, async (other) => {
-    const shop = createStore(other.config);
+    const shop = await createStore(other.config);
     try {
       const base = (await shop.catalog.read()).products.find((product) => product.id === "pmuwtba7c");
       await shop.catalog.saveProduct({ product: { ...base, stock: { "90×200": 0, "160×200": 7, "180×200": 2 } }, base });
@@ -794,7 +798,7 @@ test("visitors see whether a size is on hand, the admin sees the counts", () =>
       const page = JSON.parse((await shop.catalog.page()).slice("window.SITE_DATA = ".length, -2));
       assert.deepEqual(page.products.find((product) => product.id === base.id).stock, shown.stock);
     } finally {
-      shop.close();
+      await shop.close();
     }
   }));
 
@@ -802,121 +806,249 @@ test("an order with more lines than the bag holds keeps the first 50 and tells t
   withSite(null, async (other) => {
     const warnings = [];
     const logger = { info() {}, error() {}, warn: (message, data) => warnings.push([message, data]) };
-    const shop = createStore(other.config, logger);
+    const shop = await createStore(other.config, logger);
     try {
       const items = Array.from({ length: 60 }, (_, index) => ({ id: "gone", name: `Снятый товар ${index}`, price: 100, qty: 1 }));
       const number = await shop.orders.add(order({ items }));
       assert.equal((await shop.orders.read()).find((entry) => entry.number === number).items.length, 50);
       assert.deepEqual(warnings.map(([, data]) => data), [{ lines: 60, kept: 50 }]);
     } finally {
-      shop.close();
+      await shop.close();
     }
   }));
 
 test("an old data file put back after the move is reported, not read", () =>
   withSite(null, async (other) => {
-    createStore(other.config).close();
+    await (await createStore(other.config)).close();
     writeJson(other.config.paths.legacy.orders, [{ id: "o1", number: 1, name: "Айгуль", phone: "87771234567" }]);
     const warnings = [];
     const logger = { info() {}, error() {}, warn: (message, data) => warnings.push({ message, data }), flush: async () => {} };
-    const again = createStore(other.config, logger);
+    const again = await createStore(other.config, logger);
     try {
       assert.deepEqual(await again.orders.read(), []);
       assert.deepEqual(warnings.map((warning) => warning.data.files), [["orders.json"]]);
     } finally {
-      again.close();
+      await again.close();
     }
   }));
 
 test("a daily copy is restored without losing the database it replaces", () =>
   withSite(null, async (other) => {
-    const live = createStore(other.config);
+    const live = await createStore(other.config);
     await live.orders.add(order());
     await live.backups.daily();
     await live.orders.add(order());
-    live.close();
     writeFileSync(join(other.config.paths.backups, "2020-01-01"), "not a folder");
 
     const [backup, ...rest] = listBackups(other.config.paths);
     assert.equal(rest.length, 0);
     assert.equal(backup.day, today());
     assert.deepEqual(backup.info, { orders: 1, lastOrder: 1, products: backup.info.products, clients: 1 });
-    const kept = restoreBackup(other.config.paths, backup);
-    assert.match(kept, /^before-restore-.+\.sqlite$/);
 
-    const restored = createStore(other.config);
+    const db = await openForRestore(other.config);
+    try {
+      await assert.rejects(restoreBackup(db, other.config.paths, backup), /was not restored, nothing was changed: the site is still connected/);
+      await live.close();
+      const kept = await restoreBackup(db, other.config.paths, backup);
+      assert.match(kept, /^before-restore-.+\.json$/);
+      assert.equal(readJson(join(other.config.paths.db, kept)).tables.orders.length, 2);
+    } finally {
+      await db.close();
+    }
+
+    const restored = await createStore(other.config);
     try {
       assert.deepEqual((await restored.orders.read()).map((entry) => entry.number), [1]);
       assert.equal(await restored.orders.add(order()), 3);
     } finally {
-      restored.close();
-    }
-    const old = new DatabaseSync(join(other.config.paths.db, kept), { readOnly: true });
-    try {
-      assert.equal(old.prepare("SELECT COUNT(*) AS count FROM orders").get().count, 2);
-    } finally {
-      old.close();
+      await restored.close();
     }
   }));
 
 test("cleanup helpers decide only from a confirmed missing file, never from a folder they could not read", () =>
   withSite(null, async (other) => {
-    createStore(other.config).close();
-    const { db, database } = other.config.paths;
+    await (await createStore(other.config)).close();
+    const { db } = other.config.paths;
+    const file = join(db, "some-file.json");
+    writeFileSync(file, "{}");
     assert.equal(await statOrMissing(join(db, "no-such-file"), { delayMs: 1 }), null);
-    assert.ok(await statOrMissing(database));
+    assert.ok(await statOrMissing(file));
     assert.deepEqual(await readdirOrEmpty(join(db, "no-such-folder")), []);
-    await assert.rejects(readdirOrEmpty(database), (error) => error.code !== "ENOENT");
+    await assert.rejects(readdirOrEmpty(file), (error) => error.code !== "ENOENT");
   }));
 
 test("a damaged or foreign copy is refused before the live database is touched", () =>
   withSite(null, async (other) => {
-    const live = createStore(other.config);
+    const live = await createStore(other.config);
     await live.orders.add(order());
-    live.close();
-    const { db, database } = other.config.paths;
-    const before = readFileSync(database);
+    await live.close();
+    const { db: folder } = other.config.paths;
 
-    const garbage = join(db, "garbage.sqlite");
+    const garbage = join(folder, "garbage.json");
     writeFileSync(garbage, "not a database");
-    const foreign = join(db, "foreign.sqlite");
-    const stranger = new DatabaseSync(foreign);
-    stranger.exec("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
-    stranger.close();
+    const foreign = join(folder, "foreign.json");
+    writeJson(foreign, { format: DUMP_FORMAT, schema: 1, tables: { meta: [] } });
+    const broken = join(folder, "broken.json");
+    writeJson(broken, { format: DUMP_FORMAT, schema: 1, tables: { meta: [], settings: [], products: [], orders: [{ id: "x" }], deleted_orders: [], counters: [], clients: [], chat_files: [] } });
 
-    assert.throws(() => restoreBackup(other.config.paths, { day: "garbage", file: garbage }), /garbage was not restored, nothing was changed/);
-    assert.throws(() => restoreBackup(other.config.paths, { day: "foreign", file: foreign }), /no settings, products, orders/);
-    assert.deepEqual(readFileSync(database), before);
-    assert.deepEqual(readdirSync(db).filter((name) => /^before-restore-|\.tmp/.test(name)), []);
+    const db = await openForRestore(other.config);
+    try {
+      await assert.rejects(restoreBackup(db, other.config.paths, { day: "garbage", file: garbage }), /garbage was not restored, nothing was changed/);
+      await assert.rejects(restoreBackup(db, other.config.paths, { day: "foreign", file: foreign }), /no settings, products, orders/);
+      // Passes the checks but breaks a NOT NULL column: the transaction leaves the live data as it was.
+      await assert.rejects(restoreBackup(db, other.config.paths, { day: "broken", file: broken }), /broken was not restored, nothing was changed/);
+      assert.equal((await db.one("SELECT COUNT(*) AS count FROM orders")).count, 1);
+    } finally {
+      await db.close();
+    }
+    assert.deepEqual(readdirSync(folder).filter((name) => /\.tmp$/.test(name)), []);
   }));
 
-test("a restore never resets the order counter: an unreadable one stops it unless the owner gives the last number", () =>
+test("a restore never resets the order counter: an unreadable one stops it, and the owner's last number is kept", () =>
   withSite(null, async (other) => {
-    const live = createStore(other.config);
+    const live = await createStore(other.config);
     await live.orders.add(order());
     await live.backups.daily();
-    live.close();
+    await live.close();
     const [backup] = listBackups(other.config.paths);
-    const { db, database } = other.config.paths;
-    writeFileSync(database, "not a database");
 
-    assert.throws(() => restoreBackup(other.config.paths, backup), (error) => error instanceof CounterUnreadableError);
-    assert.equal(readFileSync(database, "utf8"), "not a database");
-    assert.deepEqual(readdirSync(db).filter((name) => /^before-restore-|\.tmp/.test(name)), []);
+    const db = await openForRestore(other.config);
+    try {
+      await db.run("ALTER TABLE counters RENAME TO counters_lost");
+      await assert.rejects(restoreBackup(db, other.config.paths, backup), (error) => error instanceof CounterUnreadableError);
+      await assert.rejects(restoreBackup(db, other.config.paths, backup, { lastNumber: 7 }), /could not be saved aside first/);
+      await db.run("ALTER TABLE counters_lost RENAME TO counters");
+      assert.deepEqual(readdirSync(other.config.paths.db).filter((name) => /^before-restore-/.test(name)), []);
 
-    const kept = restoreBackup(other.config.paths, backup, { lastNumber: 7 });
-    assert.equal(readFileSync(join(db, kept), "utf8"), "not a database");
-    const restored = createStore(other.config);
+      await restoreBackup(db, other.config.paths, backup, { lastNumber: 7 });
+    } finally {
+      await db.close();
+    }
+    const restored = await createStore(other.config);
     try {
       assert.equal(await restored.orders.add(order()), 8);
     } finally {
-      restored.close();
+      await restored.close();
     }
   }));
 
+test("the SQLite database of the old site is moved into PostgreSQL once, and its daily copies can still be restored", () =>
+  withSite((other) => {
+    const { paths } = other.config;
+    rmSync(paths.legacy.catalog);
+    const old = new DatabaseSync(paths.sqlite);
+    old.exec(`CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+      CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+      CREATE TABLE products (id TEXT PRIMARY KEY, position INTEGER NOT NULL, data TEXT NOT NULL);
+      CREATE TABLE orders (id TEXT PRIMARY KEY, number INTEGER NOT NULL UNIQUE, key TEXT UNIQUE, created_at TEXT NOT NULL, status TEXT NOT NULL,
+        name TEXT NOT NULL, phone TEXT NOT NULL, items TEXT NOT NULL, totals TEXT NOT NULL, extra TEXT);
+      CREATE TABLE deleted_orders (key TEXT PRIMARY KEY, number INTEGER NOT NULL, deleted_at TEXT NOT NULL);
+      CREATE TABLE counters (name TEXT PRIMARY KEY, value INTEGER NOT NULL);
+      CREATE TABLE clients (id TEXT PRIMARY KEY, phone TEXT NOT NULL UNIQUE, name TEXT NOT NULL, created_at TEXT NOT NULL, last_order_at TEXT NOT NULL,
+        hidden INTEGER NOT NULL DEFAULT 0, extra TEXT);
+      CREATE TABLE chat_files (id TEXT PRIMARY KEY, name TEXT NOT NULL, type TEXT NOT NULL, size INTEGER NOT NULL, session TEXT NOT NULL, text TEXT NOT NULL,
+        created_at TEXT NOT NULL, time INTEGER NOT NULL);
+      CREATE TABLE stock (product_id TEXT NOT NULL, size TEXT NOT NULL, qty INTEGER NOT NULL CHECK (qty >= 0), PRIMARY KEY (product_id, size));
+      PRAGMA user_version = 2;`);
+    old.exec(`INSERT INTO meta VALUES ('legacy_import', '{}');
+      INSERT INTO settings VALUES ('whatsapp', '"77001234567"');
+      INSERT INTO products VALUES ('pb', 0, '{"id":"pb","name":"Второй","price":200,"sizes":["90×200"]}');
+      INSERT INTO products VALUES ('pa', 0, '{"id":"pa","name":"Первый","price":100,"sizes":[]}');
+      INSERT INTO orders VALUES ('o7', 7, 'k-sqlite-0001', '2026-10-20T10:00:00.0000000+05:00', 'work', 'Айгуль', '87771234567',
+        '[{"id":"pb","name":"Второй","size":"90×200","qty":1,"price":200,"currency":"KZT","fromStock":1}]', '{"KZT":200}', '{"note":"позвонить"}');
+      INSERT INTO deleted_orders VALUES ('k-gone-0002', 5, '2026-10-19T10:00:00.0000000+05:00');
+      INSERT INTO counters VALUES ('last_order_number', 9);
+      INSERT INTO clients VALUES ('c1', '77771234567', 'Айгуль', '2026-10-20T10:00:00.0000000+05:00', '2026-10-20T10:00:00.0000000+05:00', 1, '{"vip":1}');
+      INSERT INTO chat_files VALUES ('f1', 'анализ.pdf', 'application/pdf', 3, 's1', 'текст', '2026-10-20T10:00:00.0000000+05:00', 1760936400000);
+      INSERT INTO stock VALUES ('pb', '90×200', 4);`);
+    old.close();
+    mkdirSync(join(paths.backups, "2026-10-20"), { recursive: true });
+    const copy = new DatabaseSync(paths.sqlite);
+    copy.prepare("VACUUM INTO ?").run(join(paths.backups, "2026-10-20", "zhuldyz.sqlite"));
+    copy.close();
+  }, async (other) => {
+    const { paths } = other.config;
+    const shop = await createStore(other.config);
+    try {
+      const catalog = await shop.catalog.read();
+      assert.deepEqual(catalog.products.map((product) => product.id), ["pb", "pa"]);
+      assert.deepEqual(catalog.products[0].stock, { "90×200": 4 });
+      assert.equal(catalog.settings.whatsapp, "77001234567");
+      const [moved] = await shop.orders.read();
+      assert.deepEqual([moved.number, moved.status, moved.note, moved.items[0].fromStock], [7, "work", "позвонить", 1]);
+      const [client] = await shop.clients.read();
+      assert.deepEqual([client.hidden, client.vip], [true, 1]);
+      assert.equal((await shop.chatFiles.find("f1")).entry.time, 1760936400000);
+      const buy = (extra) => order({ items: [{ id: "pa", qty: 1 }], ...extra });
+      assert.equal(await shop.orders.add(buy()), 10);
+      assert.equal(await shop.orders.add(buy({ key: "k-gone-0002" })), 5);
+      assert.equal(await shop.orders.add(buy({ key: "k-sqlite-0001" })), 7);
+
+      assert.equal(existsSync(paths.sqlite), false);
+      assert.ok(existsSync(paths.sqliteArchive));
+      assert.deepEqual(listBackups(paths).map((backup) => [backup.day, backup.info.orders, backup.info.lastOrder]), [["2026-10-20", 1, 7]]);
+    } finally {
+      await shop.close();
+    }
+
+    copyFileSync(paths.sqliteArchive, paths.sqlite);
+    const warnings = [];
+    const again = await createStore(other.config, { info() {}, error() {}, warn: (message) => warnings.push(message) });
+    try {
+      assert.equal((await again.orders.read()).length, 2);
+      assert.equal(warnings.filter((message) => message.includes("zhuldyz.sqlite is back")).length, 1);
+    } finally {
+      await again.close();
+    }
+  }));
+
+test("an empty database next to earlier data is not filled in without the owner", () =>
+  withSite(null, async (other) => {
+    await assert.rejects(createStore(other.config, undefined, { mayCreate: () => false }), NewDatabaseRefusedError);
+    const shop = await createStore(other.config, undefined, { mayCreate: () => true });
+    await shop.close();
+    // Once the tables exist the question is not asked again.
+    await (await createStore(other.config, undefined, { mayCreate: () => false })).close();
+  }));
+
+test("a connection lost in the middle of a write fails that write, not the whole site", () =>
+  withSite(null, async (other) => {
+    const shop = await createStore(other.config);
+    const killer = await openForRestore(other.config);
+    const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+    try {
+      const write = shop.db.transaction(async (tx) => {
+        const { pid } = await tx.one("SELECT pg_backend_pid() AS pid");
+        await killer.one("SELECT pg_terminate_backend($1)", [pid]);
+        await pause(300);
+        await tx.run("INSERT INTO meta (key, value) VALUES ('lost', 'write')");
+      });
+      await assert.rejects(write);
+      assert.equal((await shop.db.one("SELECT COUNT(*) AS count FROM meta WHERE key = 'lost'")).count, 0);
+
+      // Idle connections cut off (PostgreSQL restarted) are replaced on the next request.
+      await killer.query("SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = current_database() AND application_name = 'zhuldyz-site'");
+      await pause(300);
+      assert.ok((await shop.catalog.read()).products.length > 0);
+      assert.ok((await shop.orders.add(order())) > 0);
+    } finally {
+      await killer.close();
+      await shop.close();
+    }
+  }));
+
+test("a NUL character, which PostgreSQL refuses in text, does not cost an order", async () => {
+  const number = await store.orders.add(order({ name: "Айгуль\u0000", company: "ТОО\u0000 «Ромашка»" }));
+  assert.ok(number > 0);
+  const saved = (await store.orders.read()).find((entry) => entry.number === number);
+  assert.equal(saved.name, "Айгуль");
+  assert.match(saved.company, /Ромашка/);
+  assert.equal(existsSync(site.config.paths.ordersRescue), false);
+});
+
 test("photos no product and no saved copy uses are removed; fresh uploads and photos of daily copies stay", () =>
   withSite(null, async (other) => {
-    const live = createStore(other.config);
+    const live = await createStore(other.config);
     try {
       const { uploads, backups, db } = other.config.paths;
       const photo = (name) => join(uploads, name);
@@ -946,6 +1078,6 @@ test("photos no product and no saved copy uses are removed; fresh uploads and ph
       assert.deepEqual(await live.photos.cleanup(), ["in-backup.jpg"]);
       assert.deepEqual(readdirSync(uploads).sort(), ["fresh.jpg", "in-code.jpg", "kept.jpg", "Upper.jpg", "мой файл.jpg", "фото 1.jpg"].sort());
     } finally {
-      live.close();
+      await live.close();
     }
   }));

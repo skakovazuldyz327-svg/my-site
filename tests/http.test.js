@@ -17,7 +17,7 @@ mkdirSync(site.config.paths.dist, { recursive: true });
 writeFileSync(join(site.config.paths.dist, "index.html"), "<h1>ok</h1>");
 writeFileSync(join(site.config.root, ".env"), "ADMIN_PASSWORD=leak");
 
-const store = createStore(site.config);
+const store = await createStore(site.config);
 const ai = createAi({ config: site.config, store, logger: silentLogger, providers: [fakeProvider("down", [new Error("down")])] });
 const server = createApp({ config: site.config, store, logger: silentLogger, ai });
 let base = "";
@@ -26,10 +26,10 @@ before(() => new Promise((resolve) => server.listen(0, "127.0.0.1", () => {
   base = `http://127.0.0.1:${server.address().port}`;
   resolve();
 })));
-after(() => {
+after(async () => {
   server.close();
-  store.close();
-  site.cleanup();
+  await store.close();
+  await site.cleanup();
 });
 
 const admin = { "X-Admin-Password": "secret" };

@@ -1,5 +1,5 @@
 import { silentLogger } from "../log.js";
-import { parseColumn, transaction } from "./db.js";
+import { parseColumn } from "./db.js";
 import { allStock, MAX_STOCK, stockOf, withStock, writeStock } from "./stock.js";
 
 const PRODUCT_ID = /^[\w-]{1,60}$/;
@@ -91,36 +91,37 @@ function editable(product) {
 }
 
 // A product is kept as the JSON the admin page sent, so new editor fields need no schema change.
-export function insertProduct(db, product, position) {
-  db.prepare("INSERT INTO products (id, position, data) VALUES (?, ?, ?)").run(product.id, position, JSON.stringify(product));
+export async function insertProduct(db, product, position) {
+  await db.run("INSERT INTO products (id, position, data) VALUES ($1, $2, $3)", [product.id, position, JSON.stringify(product)]);
 }
 
 // The same check the shop pages make before showing the address.
 const EMAIL = /^[^\s@<>"]+@[^\s@<>"]+\.[^\s@<>"]+$/;
 
-export function saveSetting(db, key, value) {
-  db.prepare("INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value").run(key, JSON.stringify(value));
+export async function saveSetting(db, key, value) {
+  await db.run("INSERT INTO settings (key, value) VALUES ($1, $2) ON CONFLICT (key) DO UPDATE SET value = excluded.value", [key, JSON.stringify(value)]);
 }
 
 export function createCatalog(db, logger = silentLogger) {
-  const settingRows = db.prepare("SELECT key, value FROM settings ORDER BY rowid");
-  const productRows = db.prepare("SELECT id, data FROM products ORDER BY position, rowid");
-  const productRow = db.prepare("SELECT data FROM products WHERE id = ?");
   let reported = "";
 
   // A damaged row (hand edit, disk error) is left out instead of taking the shop pages down. It is neither shown nor editable,
   // so damaged lists it for the admin page and the log; the fix is a restore from db/backups.
-  function current() {
+  async function current() {
+    const { settingRows, productRows, stock } = await db.snapshot(async (tx) => ({
+      settingRows: await tx.query("SELECT key, value FROM settings ORDER BY seq"),
+      productRows: await tx.query("SELECT id, data FROM products ORDER BY position, seq"),
+      stock: await allStock(tx)
+    }));
     const settings = {};
     const damaged = [];
-    for (const row of settingRows.all()) {
+    for (const row of settingRows) {
       const value = parseColumn(row.value, () => true);
       if (value !== undefined) settings[row.key] = value;
       else damaged.push({ kind: "setting", id: String(row.key) });
     }
-    const stock = allStock(db);
     const products = [];
-    for (const row of productRows.all()) {
+    for (const row of productRows) {
       const product = parseColumn(row.data, (value) => isRecord(value) && typeof value.id === "string");
       if (product) products.push(withStock(product, stock.get(product.id)));
       else damaged.push({ kind: "product", id: String(row.id) });
@@ -142,38 +143,38 @@ export function createCatalog(db, logger = silentLogger) {
 
   // Each admin action changes one thing in one transaction, so two open admin pages cannot erase each other's work.
   // apply() returns an error code to refuse the change.
-  function change(apply) {
+  async function change(apply) {
     try {
-      transaction(db, () => {
-        const error = apply();
+      await db.transaction(async (tx) => {
+        const error = await apply(tx);
         if (error) throw new Refused(error);
       });
-      return { ok: true, catalog: current() };
+      return { ok: true, catalog: await current() };
     } catch (error) {
-      if (error instanceof Refused) return { ok: false, error: error.message, catalog: current() };
+      if (error instanceof Refused) return { ok: false, error: error.message, catalog: await current() };
       throw error;
     }
   }
 
   return {
-    read: async () => current(),
+    read: current,
 
-    shown: async () => forVisitors(current()),
+    shown: async () => forVisitors(await current()),
 
     // The shop pages load the catalog as a script; built from the database on every request, it is never behind.
-    page: async () => `window.SITE_DATA = ${JSON.stringify(forVisitors(current()), null, 2)};\n`,
+    page: async () => `window.SITE_DATA = ${JSON.stringify(forVisitors(await current()), null, 2)};\n`,
 
     // base is the product as the admin page last saw it (null for a new one); anything else means another page changed it meanwhile.
     // stockBase is the counts the editor started from: the admin's change is added to what is on hand now, so orders
     // that took pieces while the editor was open are not undone.
     async saveProduct(payload) {
       const product = cleanProduct(payload?.product);
-      if (!product) return { ok: false, error: "invalid", catalog: current() };
+      if (!product) return { ok: false, error: "invalid", catalog: await current() };
       const stockBase = payload.stockBase !== undefined ? payload.stockBase : payload.base?.stock;
-      return change(() => {
-        const row = productRow.get(product.id);
+      return change(async (tx) => {
+        const row = await tx.one("SELECT data FROM products WHERE id = $1", [product.id]);
         const stored = row ? parseColumn(row.data, isRecord) : undefined;
-        const saved = stored ? withStock(stored, stockOf(db, product.id)) : null;
+        const saved = stored ? withStock(stored, await stockOf(tx, product.id)) : null;
         if (JSON.stringify(editable(saved)) !== JSON.stringify(editable(payload.base ?? null))) return "conflict";
         const { stock, ...data } = product;
         let counted = null;
@@ -186,18 +187,18 @@ export function createCatalog(db, logger = silentLogger) {
           }
           data.inStock = Object.values(counted).some((qty) => qty > 0);
         }
-        if (row) db.prepare("UPDATE products SET data = ? WHERE id = ?").run(JSON.stringify(data), product.id);
-        else insertProduct(db, data, db.prepare("SELECT COALESCE(MIN(position), 0) - 1 AS first FROM products").get().first);
-        writeStock(db, product.id, counted);
+        if (row) await tx.run("UPDATE products SET data = $1 WHERE id = $2", [JSON.stringify(data), product.id]);
+        else await insertProduct(tx, data, (await tx.one("SELECT COALESCE(MIN(position), 0) - 1 AS first FROM products")).first);
+        await writeStock(tx, product.id, counted);
         return "";
       });
     },
 
     async removeProduct(payload) {
       const id = String(payload?.id ?? "");
-      return change(() => {
-        db.prepare("DELETE FROM products WHERE id = ?").run(id);
-        writeStock(db, id, null);
+      return change(async (tx) => {
+        await tx.run("DELETE FROM products WHERE id = $1", [id]);
+        await writeStock(tx, id, null);
         return "";
       });
     },
@@ -209,9 +210,9 @@ export function createCatalog(db, logger = silentLogger) {
       if (whatsapp.length < 10 || whatsapp.length > 15) return { ok: false, error: "invalid" };
       const email = payload.email === undefined ? undefined : String(payload.email ?? "").trim();
       if (email && (email.length > 120 || !EMAIL.test(email))) return { ok: false, error: "invalid" };
-      return change(() => {
-        saveSetting(db, "whatsapp", whatsapp);
-        if (email !== undefined) saveSetting(db, "email", email);
+      return change(async (tx) => {
+        await saveSetting(tx, "whatsapp", whatsapp);
+        if (email !== undefined) await saveSetting(tx, "email", email);
         return "";
       });
     },
@@ -220,8 +221,8 @@ export function createCatalog(db, logger = silentLogger) {
     async saveCompany(payload) {
       const company = cleanCompany(payload?.company);
       if (!company) return { ok: false, error: "invalid" };
-      return change(() => {
-        saveSetting(db, "company", company);
+      return change(async (tx) => {
+        await saveSetting(tx, "company", company);
         return "";
       });
     }

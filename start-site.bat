@@ -8,6 +8,11 @@ if errorlevel 1 (
   call "%~dp0build-site.bat" nopause
   if errorlevel 1 echo   Build failed - the site may show the previous version.
 )
+if not exist "%~dp0node_modules\pg" (
+  echo   Installing the database driver...
+  call "%~dp0.tools\node\npm.cmd" install --no-audit --no-fund
+)
+call "%~dp0start-database.bat"
 set "OPEN_FLAG="
 set "RESTARTS=0"
 :run

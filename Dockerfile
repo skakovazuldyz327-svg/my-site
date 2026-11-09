@@ -7,13 +7,14 @@ COPY frontend/ ./
 COPY shared/ ../shared/
 RUN npm run build
 
-# Stage 2: the Node server (no npm dependencies, only built-in modules such as node:sqlite)
+# Stage 2: the Node server; its one npm dependency is pg, the PostgreSQL driver
 FROM node:24-slim
 ENV NODE_ENV=production \
     HOST=0.0.0.0 \
     PORT=8765
 WORKDIR /app
-COPY package.json ./
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev --no-audit --no-fund
 COPY server/ ./server/
 COPY shared/ ./shared/
 COPY --from=build /app/dist ./dist/

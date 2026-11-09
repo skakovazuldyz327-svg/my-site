@@ -1,19 +1,45 @@
 # Zhuldyz site in Docker.
 #
+#   docker compose up -d postgres    start only the database; start-site.bat does this itself
 #   docker compose run --rm seed     copy the current db/ and images/ into Docker once (originals are read-only)
 #   docker compose up -d --build     start the site at http://localhost:8080/
 #   docker compose stop              stop it (data stays)
 #
 # Never use "docker compose down -v": -v deletes the volumes with the database and photos.
+# POSTGRES_PASSWORD comes from .env.
 
 name: zhuldyz
 
 services:
+  # The site started by start-site.bat uses the database "zhuldyz"; the site in Docker keeps its own copy in "zhuldyz_docker",
+  # because its photos and chat files live in Docker volumes, not in the site folder.
+  postgres:
+    image: postgres:17-alpine
+    container_name: zhuldyz-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: zhuldyz
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: zhuldyz
+    # Only this computer can reach the database.
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - zhuldyz-postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U zhuldyz -d zhuldyz"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
   site:
     build: .
     image: zhuldyz-site:latest
     container_name: zhuldyz-site
     restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
     ports:
       - "8080:8765"
     env_file:
@@ -24,13 +50,16 @@ services:
     environment:
       HOST: 0.0.0.0
       PORT: "8765"
+      POSTGRES_HOST: postgres
+      POSTGRES_DB: zhuldyz_docker
       # The Windows path from .env means nothing inside Linux
       BACKUP_COPY_DIR: ""
     volumes:
       - zhuldyz-db:/app/db
       - zhuldyz-images:/app/images
 
-  # One-off: fills the empty Docker volumes with a copy of the current data. Refuses if a database is already there.
+  # One-off: fills the empty Docker volumes with a copy of the current data. Refuses if data is already there.
+  # The site in Docker moves the copied zhuldyz.sqlite into its PostgreSQL database on its first start.
   seed:
     profiles: ["seed"]
     image: zhuldyz-site:latest
@@ -45,13 +74,14 @@ services:
       - sh
       - -c
       - |
-        if [ -e /app/db/zhuldyz.sqlite ]; then
-          echo "Docker already has a database - nothing was copied."; exit 1
+        if [ -n "$$(ls -A /app/db 2>/dev/null)" ]; then
+          echo "Docker already has data - nothing was copied."; exit 1
         fi
         cp -a /from/db/. /app/db/ && cp -a /from/images/. /app/images/ &&
         chown -R node:node /app/db /app/images &&
-        echo "Copied: $$(ls /app/images/products | wc -l) photos, database $$(du -h /app/db/zhuldyz.sqlite | cut -f1)"
+        echo "Copied: $$(ls /app/images/products | wc -l) photos"
 
 volumes:
+  zhuldyz-postgres:
   zhuldyz-db:
   zhuldyz-images:

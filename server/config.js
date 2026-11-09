@@ -23,6 +23,28 @@ function list(value) {
   return String(value || "").split(",").map((item) => item.trim()).filter(Boolean);
 }
 
+// DATABASE_URL (postgres://user:password@host:port/name) wins over the separate POSTGRES_* settings.
+function databaseSettings(get) {
+  const url = get("DATABASE_URL", "");
+  if (url) {
+    const parsed = new URL(url);
+    return {
+      host: decodeURIComponent(parsed.hostname),
+      port: Number(parsed.port) || 5432,
+      user: decodeURIComponent(parsed.username),
+      password: decodeURIComponent(parsed.password),
+      database: decodeURIComponent(parsed.pathname.replace(/^\//, ""))
+    };
+  }
+  return {
+    host: get("POSTGRES_HOST", "127.0.0.1"),
+    port: Number(get("POSTGRES_PORT", "")) || 5432,
+    user: get("POSTGRES_USER", "zhuldyz"),
+    password: get("POSTGRES_PASSWORD", ""),
+    database: get("POSTGRES_DB", "zhuldyz")
+  };
+}
+
 export function loadConfig(root = ROOT, overrides = {}) {
   const file = readEnvFile(join(root, ".env"));
   const get = (name, fallback) => overrides[name] || process.env[name] || file[name] || fallback;
@@ -42,12 +64,17 @@ export function loadConfig(root = ROOT, overrides = {}) {
     chatPerMinute: number("CHAT_PER_MINUTE", 20),
     chatConcurrent: number("CHAT_CONCURRENT", 8),
     ordersPerHour: number("ORDERS_PER_HOUR", 20),
+    database: databaseSettings(get),
+    // How long the start waits for PostgreSQL: Docker Desktop may still be starting the container.
+    databaseWaitMs: number("DATABASE_WAIT_MS", 60000),
     paths: {
       dist: join(root, "dist"),
       images: join(root, "images"),
       uploads: join(root, "images", "products"),
       db,
-      database: join(db, "zhuldyz.sqlite"),
+      // The SQLite database of the site before PostgreSQL: moved in on the first start, then kept as sqliteArchive.
+      sqlite: join(db, "zhuldyz.sqlite"),
+      sqliteArchive: join(db, "zhuldyz-before-postgres.sqlite"),
       ordersRescue: join(db, "orders-rescue.jsonl"),
       backups: join(db, "backups"),
       chatFiles: join(db, "chat-files"),

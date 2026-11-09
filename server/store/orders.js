@@ -2,7 +2,7 @@ import { appendFileSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { silentLogger } from "../log.js";
 import { mergeClient } from "./clients.js";
-import { extraOf, parseColumn, parseExtra, transaction } from "./db.js";
+import { extraOf, parseColumn, parseExtra } from "./db.js";
 import { localIso, shortId } from "./files.js";
 import { returnStock, takeStock } from "./stock.js";
 
@@ -98,8 +98,8 @@ function fromRow(row) {
   };
 }
 
-export function insertOrder(db, order) {
-  db.prepare("INSERT INTO orders (id, number, key, created_at, status, name, phone, items, totals, extra) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").run(
+export async function insertOrder(db, order) {
+  await db.run("INSERT INTO orders (id, number, key, created_at, status, name, phone, items, totals, extra) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)", [
     order.id,
     order.number,
     order.key || null,
@@ -110,28 +110,32 @@ export function insertOrder(db, order) {
     JSON.stringify(order.items),
     JSON.stringify(order.totals),
     extraOf(order, FIELDS)
-  );
+  ]);
 }
 
 // Deleted orders must not free their numbers: the client may still have that number in WhatsApp.
-export function nextOrderNumber(db) {
-  const counter = db.prepare("SELECT value FROM counters WHERE name = 'last_order_number'").get()?.value ?? 0;
-  const highest = db.prepare("SELECT COALESCE(MAX(number), 0) AS highest FROM orders").get().highest;
-  return 1 + Math.max(counter, highest);
+export async function nextOrderNumber(db) {
+  const row = await db.one(
+    "SELECT GREATEST((SELECT value FROM counters WHERE name = 'last_order_number'), (SELECT MAX(number) FROM orders), 0) AS last"
+  );
+  return 1 + row.last;
 }
 
-export function setLastOrderNumber(db, number) {
-  db.prepare("INSERT INTO counters (name, value) VALUES ('last_order_number', ?) ON CONFLICT (name) DO UPDATE SET value = MAX(value, excluded.value)").run(number);
+export async function setLastOrderNumber(db, number) {
+  await db.run(
+    "INSERT INTO counters (name, value) VALUES ('last_order_number', $1) ON CONFLICT (name) DO UPDATE SET value = GREATEST(counters.value, excluded.value)",
+    [number]
+  );
 }
 
 // A browser repeats an order it never got an answer for; the keys of deleted orders keep such a repeat from bringing one back.
-export function savedNumberForKey(db, key) {
-  return db.prepare("SELECT number FROM orders WHERE key = ? UNION ALL SELECT number FROM deleted_orders WHERE key = ?").get(key, key)?.number ?? 0;
+export async function savedNumberForKey(db, key) {
+  const row = await db.one("SELECT number FROM orders WHERE key = $1 UNION ALL SELECT number FROM deleted_orders WHERE key = $1 LIMIT 1", [key]);
+  return row?.number ?? 0;
 }
 
-export function createOrders(db, { catalog, paths, logger = silentLogger }) {
-  const rows = db.prepare("SELECT * FROM orders ORDER BY number");
-  let lastIssued = nextOrderNumber(db) - 1;
+export async function createOrders(db, { catalog, paths, logger = silentLogger }) {
+  let lastIssued = (await nextOrderNumber(db)) - 1;
   // With the database unreadable an order is still priced from the catalog it last showed, and then rescued.
   let knownProducts = [];
   const products = () => catalog.read().then(
@@ -141,7 +145,7 @@ export function createOrders(db, { catalog, paths, logger = silentLogger }) {
       return knownProducts;
     }
   );
-  products().catch(() => {});
+  await products().catch(() => {});
 
   // The database refused the write (disk error, file held by another program): the order goes to a side file instead of
   // being lost, and the next start moves it into the database.
@@ -155,11 +159,13 @@ export function createOrders(db, { catalog, paths, logger = silentLogger }) {
   }
 
   return {
-    read: async () => rows.all().map(fromRow),
+    read: async () => (await db.query("SELECT * FROM orders ORDER BY number")).map(fromRow),
 
     // What the shop page needs to print the invoice for the order it has just sent, and nothing more.
     async invoice(number) {
-      const row = db.prepare("SELECT * FROM orders WHERE number = ?").get(Number(number) || 0);
+      const wanted = Number(number);
+      if (!Number.isInteger(wanted) || wanted < 1 || wanted > 2 ** 31 - 1) return null;
+      const row = await db.one("SELECT * FROM orders WHERE number = $1", [wanted]);
       if (!row) return null;
       const order = fromRow(row);
       return {
@@ -176,14 +182,14 @@ export function createOrders(db, { catalog, paths, logger = silentLogger }) {
     async setBuyer(payload) {
       const buyer = cleanBuyer(payload, true);
       if (!buyer) return false;
-      return transaction(db, () => {
-        const row = db.prepare("SELECT extra FROM orders WHERE id = ?").get(String(payload?.id ?? ""));
+      return db.transaction(async (tx) => {
+        const row = await tx.one("SELECT extra FROM orders WHERE id = $1", [String(payload?.id ?? "")]);
         // Damaged details are left for a repair from a backup rather than written over.
         const current = row ? parseExtra(row.extra) : undefined;
         if (!current) return false;
         const { company, bin, address, ...rest } = current;
         const extra = { ...rest, ...filled(buyer) };
-        db.prepare("UPDATE orders SET extra = ? WHERE id = ?").run(Object.keys(extra).length ? JSON.stringify(extra) : null, String(payload.id));
+        await tx.run("UPDATE orders SET extra = $1 WHERE id = $2", [Object.keys(extra).length ? JSON.stringify(extra) : null, String(payload.id)]);
         return true;
       });
     },
@@ -227,17 +233,17 @@ export function createOrders(db, { catalog, paths, logger = silentLogger }) {
       const createdAt = localIso();
       const order = { id: shortId(), number: 0, ...(key ? { key } : {}), createdAt, status: "new", name, phone, items, totals, ...filled(cleanBuyer(payload, false)) };
       try {
-        return transaction(db, () => {
-          const same = key ? savedNumberForKey(db, key) : 0;
+        return await db.transaction(async (tx) => {
+          const same = key ? await savedNumberForKey(tx, key) : 0;
           if (same) return same;
           // A number given to an order in the rescue file is not in the database yet, but the buyer already has it.
-          const number = Math.max(nextOrderNumber(db), lastIssued + 1);
-          insertOrder(db, { ...order, number });
-          setLastOrderNumber(db, number);
+          const number = Math.max(await nextOrderNumber(tx), lastIssued + 1);
+          await insertOrder(tx, { ...order, number });
+          await setLastOrderNumber(tx, number);
           order.number = number;
           // The order matters more than the client card: a failed client update must not cost the order.
           try {
-            mergeClient(db, name, phone, createdAt);
+            await tx.savepoint(() => mergeClient(tx, name, phone, createdAt));
           } catch (error) {
             logger.error("client save failed", { message: error.message });
           }
@@ -254,34 +260,36 @@ export function createOrders(db, { catalog, paths, logger = silentLogger }) {
     async setStatus(payload) {
       const status = String(payload?.status ?? "");
       if (!STATUSES.includes(status)) return false;
-      return transaction(db, () => {
-        const order = db.prepare("SELECT status, items FROM orders WHERE id = ?").get(String(payload.id ?? ""));
+      return db.transaction(async (tx) => {
+        const order = await tx.one("SELECT status, items FROM orders WHERE id = $1", [String(payload.id ?? "")]);
         if (!order) return false;
         let items = readItems(order.items);
         // Unreadable lines cannot move stock; they are kept as they are for a repair from a backup.
         if (!items) {
-          db.prepare("UPDATE orders SET status = ? WHERE id = ?").run(status, String(payload.id));
+          await tx.run("UPDATE orders SET status = $1 WHERE id = $2", [status, String(payload.id)]);
           return true;
         }
         const held = HOLDS_STOCK.includes(order.status);
-        if (!held && HOLDS_STOCK.includes(status)) items = takeStock(db, items);
-        else if (status === "cancel" || (held && !HOLDS_STOCK.includes(status))) items = returnStock(db, items);
+        if (!held && HOLDS_STOCK.includes(status)) items = await takeStock(tx, items);
+        else if (status === "cancel" || (held && !HOLDS_STOCK.includes(status))) items = await returnStock(tx, items);
         // A new order is not checked against the stock yet, so a line that holds nothing must not read as "was not on hand".
         if (status === "new") items = items.map(({ fromStock, ...line }) => (fromStock > 0 ? { ...line, fromStock } : line));
-        db.prepare("UPDATE orders SET status = ?, items = ? WHERE id = ?").run(status, JSON.stringify(items), String(payload.id));
+        await tx.run("UPDATE orders SET status = $1, items = $2 WHERE id = $3", [status, JSON.stringify(items), String(payload.id)]);
         return true;
       });
     },
 
     // Deleting an order that was never carried out gives its pieces back; a done order was sold, a cancelled one gave them back already.
     async remove(payload) {
-      return transaction(db, () => {
-        const order = db.prepare("SELECT number, key, status, items FROM orders WHERE id = ?").get(String(payload?.id ?? ""));
+      return db.transaction(async (tx) => {
+        const order = await tx.one("SELECT number, key, status, items FROM orders WHERE id = $1", [String(payload?.id ?? "")]);
         if (!order) return false;
         const items = readItems(order.items);
-        if (items && (order.status === "new" || order.status === "work")) returnStock(db, items);
-        db.prepare("DELETE FROM orders WHERE id = ?").run(String(payload.id));
-        if (order.key) db.prepare("INSERT OR IGNORE INTO deleted_orders (key, number, deleted_at) VALUES (?, ?, ?)").run(order.key, order.number, localIso());
+        if (items && (order.status === "new" || order.status === "work")) await returnStock(tx, items);
+        await tx.run("DELETE FROM orders WHERE id = $1", [String(payload.id)]);
+        if (order.key) {
+          await tx.run("INSERT INTO deleted_orders (key, number, deleted_at) VALUES ($1, $2, $3) ON CONFLICT (key) DO NOTHING", [order.key, order.number, localIso()]);
+        }
         return true;
       });
     }

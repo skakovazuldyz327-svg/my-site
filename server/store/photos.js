@@ -1,12 +1,14 @@
 import { readFile, rm } from "node:fs/promises";
-import { join, resolve } from "node:path";
+import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { silentLogger } from "../log.js";
+import { dumpDatabase } from "./db.js";
 import { listFiles, readdirOrEmpty, statOrMissing } from "./files.js";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
-function databaseText(db) {
+// Daily copies and the archive from the SQLite days are still .sqlite files.
+function sqliteText(db) {
   const tables = db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'").all();
   const parts = [];
   for (const { name } of tables) {
@@ -28,7 +30,7 @@ function isMentioned(texts, name) {
 // shows it, so restoring any of them brings the photos back too. A fresh upload stays a day: its product may not be saved yet.
 export function createPhotos(db, paths, logger = silentLogger) {
   async function savedTexts() {
-    const texts = [databaseText(db)];
+    const texts = [JSON.stringify((await dumpDatabase(db)).tables)];
     for (const file of await listFiles(paths.dist)) {
       if (/\.(html|js|css)$/.test(file)) texts.push(await readFile(file, "utf8"));
     }
@@ -37,12 +39,12 @@ export function createPhotos(db, paths, logger = silentLogger) {
       ...(await readdirOrEmpty(paths.db, { withFileTypes: true })).filter((entry) => entry.isFile()).map((entry) => join(paths.db, entry.name))
     ];
     for (const file of saved) {
-      // full-backup-* is the short-lived copy of a zip download, the same data as the live database.
-      if (resolve(file) === resolve(paths.database) || /[\\/]full-backup-[^\\/]*$/.test(file)) continue;
+      // full-backup-* is the short-lived copy of a zip download made by the SQLite version, the same data as its database.
+      if (/[\\/]full-backup-[^\\/]*$/.test(file)) continue;
       if (file.endsWith(".sqlite")) {
         const copy = new DatabaseSync(file, { readOnly: true });
         try {
-          texts.push(databaseText(copy));
+          texts.push(sqliteText(copy));
         } finally {
           copy.close();
         }

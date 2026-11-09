@@ -11,7 +11,7 @@ import { fakeProvider, tempSite } from "./helpers.js";
 const site = tempSite();
 site.config.chatFiles = { maxFileBytes: 64 * 1024, totalBytes: 100 * 1024, days: 90, perHour: 8, bytesPerDay: 90 * 1024 };
 
-const store = createStore(site.config);
+const store = await createStore(site.config);
 const ai = createAi({ config: site.config, store, logger: silentLogger, providers: [fakeProvider("down", [new Error("down")])] });
 const server = createApp({ config: site.config, store, logger: silentLogger, ai });
 let base = "";
@@ -20,10 +20,10 @@ before(() => new Promise((resolve) => server.listen(0, "127.0.0.1", () => {
   base = `http://127.0.0.1:${server.address().port}`;
   resolve();
 })));
-after(() => {
+after(async () => {
   server.close();
-  store.close();
-  site.cleanup();
+  await store.close();
+  await site.cleanup();
 });
 
 const admin = { "X-Admin-Password": "secret" };
