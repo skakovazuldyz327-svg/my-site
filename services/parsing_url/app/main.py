@@ -5,11 +5,13 @@ import os
 import secrets
 import socket
 from contextlib import asynccontextmanager, suppress
+from pathlib import Path
 from typing import Optional
 from urllib.parse import urlsplit
 
 from crawl4ai import AsyncWebCrawler, BrowserConfig, CacheMode, CrawlerRunConfig
 from fastapi import Depends, FastAPI, HTTPException, Security
+from fastapi.responses import FileResponse
 from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, HttpUrl
 
@@ -22,6 +24,18 @@ REQUEST_TIMEOUT_S = float(os.getenv("REQUEST_TIMEOUT_S", "240"))
 WARMUP_RETRY_S = float(os.getenv("WARMUP_RETRY_S", "30"))
 API_KEY = os.getenv("API_KEY", "")
 ALLOW_PRIVATE_URLS = os.getenv("ALLOW_PRIVATE_URLS", "false").lower() == "true"
+
+INDEX_HTML = Path(__file__).parent / "static" / "index.html"
+# Images stay open (img-src *) because the sandboxed preview of a parsed page inherits this policy.
+INDEX_HEADERS = {
+    "Content-Security-Policy": (
+        "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; "
+        "img-src * data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'"
+    ),
+    "X-Content-Type-Options": "nosniff",
+    "Referrer-Policy": "no-referrer",
+    "Cache-Control": "no-cache",
+}
 
 
 class ParseRequest(BaseModel):
@@ -168,6 +182,11 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Crawl4AI Service", version="1.1.0", lifespan=lifespan)
+
+
+@app.get("/", include_in_schema=False)
+async def index() -> FileResponse:
+    return FileResponse(INDEX_HTML, headers=INDEX_HEADERS)
 
 
 @app.get("/health")
