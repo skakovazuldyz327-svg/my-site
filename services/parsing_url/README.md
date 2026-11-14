@@ -83,8 +83,8 @@ Invoke-RestMethod -Method Post -Uri http://localhost:8000/parse `
 {
   "success": true,
   "url": "https://example.com/",
-  "markdown": "# Example Domain\n\nThis domain is for use in illustrative examples...",
-  "cleaned_html": "<div><h1>Example Domain</h1>...</div>",
+  "markdown": "This domain is for use in documentation examples without needing permission...",
+  "cleaned_html": "<html>\n<head><title>Example Domain</title></head>\n<body>\n<p>This domain is for use in documentation examples...</p>...</body>\n</html>",
   "error_message": null
 }
 ```
