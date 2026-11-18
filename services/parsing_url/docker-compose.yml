@@ -9,18 +9,25 @@ services:
     environment:
       MAX_CONCURRENCY: "2"
       PAGE_TIMEOUT_MS: "60000"
-      REQUEST_TIMEOUT_S: "240"
+      REQUEST_TIMEOUT_S: "120"
       API_KEY: "${API_KEY:-}"
+      # Local default: open /parse without a key. Set ALLOW_INSECURE=false and API_KEY=... for safer setups.
+      ALLOW_INSECURE: "${ALLOW_INSECURE:-true}"
       ALLOW_PRIVATE_URLS: "false"
       LOG_LEVEL: "INFO"
       CRAWL4AI_NO_CLOUD_NOTICE: "1"
     init: true
     mem_limit: 2g
+    cpus: "1.0"
     shm_size: "512m"
+    # Chromium/Playwright needs basic process capabilities; dropping ALL caps hangs browser startup.
+    security_opt:
+      - no-new-privileges:true
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "python", "-c", "import json,sys,urllib.request; r=json.load(urllib.request.urlopen('http://localhost:8000/health', timeout=5)); sys.exit(1 if r.get('browser') == 'error' else 0)"]
+      # Ready only when Chromium is up — "starting"/"error" keep the container unhealthy.
+      test: ["CMD", "python", "-c", "import json,sys,urllib.request; r=json.load(urllib.request.urlopen('http://localhost:8000/health', timeout=5)); sys.exit(0 if r.get('browser') == 'ready' else 1)"]
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 60s
+      start_period: 120s

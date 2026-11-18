@@ -20,10 +20,11 @@ logger = logging.getLogger("crawl4ai-service")
 
 MAX_CONCURRENCY = int(os.getenv("MAX_CONCURRENCY", "2"))
 PAGE_TIMEOUT_MS = int(os.getenv("PAGE_TIMEOUT_MS", "60000"))
-REQUEST_TIMEOUT_S = float(os.getenv("REQUEST_TIMEOUT_S", "240"))
+REQUEST_TIMEOUT_S = float(os.getenv("REQUEST_TIMEOUT_S", "120"))
 WARMUP_RETRY_S = float(os.getenv("WARMUP_RETRY_S", "30"))
 API_KEY = os.getenv("API_KEY", "")
 ALLOW_PRIVATE_URLS = os.getenv("ALLOW_PRIVATE_URLS", "false").lower() == "true"
+ALLOW_INSECURE = os.getenv("ALLOW_INSECURE", "false").lower() == "true"
 
 INDEX_HTML = Path(__file__).parent / "static" / "index.html"
 # Images stay open (img-src *) because the sandboxed preview of a parsed page inherits this policy.
@@ -55,6 +56,17 @@ class BlockedURLError(Exception):
     pass
 
 
+def fail_response(url: str, error_message: str) -> ParseResponse:
+    """API contract: on failure content fields are always null."""
+    return ParseResponse(
+        success=False,
+        url=url,
+        markdown=None,
+        cleaned_html=None,
+        error_message=error_message,
+    )
+
+
 class CrawlerHolder:
     """Lazily starts a single shared browser and replaces it if Chromium dies."""
 
@@ -73,6 +85,10 @@ class CrawlerHolder:
                 crawler = AsyncWebCrawler(config=BrowserConfig(headless=True, verbose=False))
                 try:
                     await crawler.start()
+                    # Abort navigations/subresources to private/loopback hosts before they load.
+                    crawler.crawler_strategy.set_hook(
+                        "on_page_context_created", _install_ssrf_route_guard
+                    )
                 except BaseException:
                     self.state = "error"
                     with suppress(Exception):
@@ -113,6 +129,8 @@ class CrawlerHolder:
 crawler_holder = CrawlerHolder()
 semaphore = asyncio.Semaphore(MAX_CONCURRENCY)
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+# hostname -> True if all resolved addresses are public
+_host_public_cache: dict[str, bool] = {}
 
 
 def require_api_key(key: Optional[str] = Security(api_key_header)) -> None:
@@ -128,18 +146,70 @@ async def ensure_public_url(url: str) -> None:
     if ALLOW_PRIVATE_URLS:
         return
     parts = urlsplit(url)
+    scheme = (parts.scheme or "").lower()
+    if scheme not in ("http", "https"):
+        raise BlockedURLError(f"Unsupported URL scheme '{scheme or '?'}'")
     host = parts.hostname or ""
-    port = parts.port or (443 if parts.scheme == "https" else 80)
+    if not host:
+        raise BlockedURLError("URL has no hostname")
+    port = parts.port or (443 if scheme == "https" else 80)
+
+    cached = _host_public_cache.get(host)
+    if cached is True:
+        return
+    if cached is False:
+        raise BlockedURLError(f"URL host '{host}' resolves to a non-public address")
+
     try:
         infos = await asyncio.get_running_loop().getaddrinfo(host, port, type=socket.SOCK_STREAM)
     except socket.gaierror as exc:
         raise BlockedURLError(f"Cannot resolve host '{host}': {exc}") from exc
+
     for info in infos:
         ip = ipaddress.ip_address(info[4][0].split("%")[0])
         if getattr(ip, "ipv4_mapped", None):
             ip = ip.ipv4_mapped
         if not ip.is_global:
+            _host_public_cache[host] = False
             raise BlockedURLError(f"URL host '{host}' resolves to a non-public address ({ip})")
+    _host_public_cache[host] = True
+
+
+async def _install_ssrf_route_guard(page, context=None, **kwargs):
+    """Playwright route: block document/XHR hops (incl. redirects) to non-public hosts.
+
+    Checking every image/font would stall Chromium under CPU limits; subresources
+    remain a residual risk — use network isolation for internet-facing deploys.
+    """
+
+    async def _handler(route):
+        if ALLOW_PRIVATE_URLS:
+            await route.continue_()
+            return
+        request = route.request
+        # document = top-level navigations and HTTP redirects between them
+        if request.resource_type not in ("document", "xhr", "fetch"):
+            await route.continue_()
+            return
+        req_url = request.url
+        parts = urlsplit(req_url)
+        if parts.scheme in ("data", "blob", "about"):
+            await route.continue_()
+            return
+        try:
+            await ensure_public_url(req_url)
+        except BlockedURLError as exc:
+            logger.warning("SSRF guard blocked %s (%s)", req_url, exc)
+            await route.abort("blockedbyclient")
+            return
+        except Exception:
+            logger.exception("SSRF guard failed for %s", req_url)
+            await route.abort("failed")
+            return
+        await route.continue_()
+
+    await page.route("**/*", _handler)
+    return page
 
 
 async def _warmup() -> None:
@@ -170,6 +240,14 @@ async def recover_browser() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    if not API_KEY:
+        if ALLOW_INSECURE:
+            logger.warning("API_KEY is empty — /parse is open (ALLOW_INSECURE=true)")
+        else:
+            raise RuntimeError(
+                "API_KEY is required when ALLOW_INSECURE=false. "
+                "Set API_KEY or ALLOW_INSECURE=true for local use."
+            )
     ensure_warmup()
     try:
         yield
@@ -181,7 +259,7 @@ async def lifespan(app: FastAPI):
         await crawler_holder.close()
 
 
-app = FastAPI(title="Crawl4AI Service", version="1.1.0", lifespan=lifespan)
+app = FastAPI(title="Crawl4AI Service", version="1.2.0", lifespan=lifespan)
 
 
 @app.get("/", include_in_schema=False)
@@ -191,7 +269,11 @@ async def index() -> FileResponse:
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "browser": crawler_holder.state}
+    browser = crawler_holder.state
+    return {
+        "status": "ok" if browser == "ready" else "starting",
+        "browser": browser,
+    }
 
 
 async def _crawl(url: str, run_config: CrawlerRunConfig):
@@ -222,31 +304,36 @@ async def parse(body: ParseRequest) -> ParseResponse:
     try:
         await ensure_public_url(url)
         result = await asyncio.wait_for(_crawl(url, run_config), timeout=REQUEST_TIMEOUT_S)
-        if result.redirected_url and result.redirected_url != url:
-            await ensure_public_url(result.redirected_url)
+        # Defense in depth: final URL after redirects (route guard already blocked private hops).
+        final_url = getattr(result, "redirected_url", None) or url
+        if final_url != url:
+            await ensure_public_url(final_url)
     except BlockedURLError as exc:
-        return ParseResponse(success=False, url=url, error_message=str(exc))
+        return fail_response(url, str(exc))
     except asyncio.TimeoutError:
         logger.warning("Request timed out for %s", url)
         await recover_browser()
-        return ParseResponse(
-            success=False, url=url, error_message=f"Request timed out after {REQUEST_TIMEOUT_S:.0f}s"
-        )
+        return fail_response(url, f"Request timed out after {REQUEST_TIMEOUT_S:.0f}s")
     except Exception as exc:
         logger.exception("Crawl failed for %s", url)
         await recover_browser()
-        return ParseResponse(success=False, url=url, error_message=str(exc))
+        return fail_response(url, str(exc))
+
+    success = bool(result.success)
+    if not success:
+        return fail_response(
+            url, result.error_message or "Crawl failed"
+        )
 
     markdown = result.markdown
     if markdown is not None:
         markdown = getattr(markdown, "raw_markdown", None) or str(markdown)
 
-    success = bool(result.success)
     return ParseResponse(
-        success=success,
+        success=True,
         url=url,
         markdown=markdown,
         cleaned_html=result.cleaned_html,
         # crawl4ai reports "" on success; the API contract is null.
-        error_message=result.error_message or (None if success else "Crawl failed"),
+        error_message=result.error_message or None,
     )
