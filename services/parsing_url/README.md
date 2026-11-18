@@ -123,9 +123,26 @@ Invoke-RestMethod -Method Post -Uri http://localhost:8000/parse `
 
 ## Тесты
 
+Unit/API (без живого браузера; удобно в Docker-образе сервиса):
+
 ```bash
-pip install -r requirements-dev.txt
-pytest -q
+docker run --rm -v "${PWD}:/app" -w /app -e ALLOW_INSECURE=true crawl4ai-service:latest \
+  sh -c "pip install -q --user pytest pytest-asyncio httpx && python -m pytest -q -m 'not e2e'"
+```
+
+Live e2e (сервис уже запущен и `healthy`):
+
+```bash
+docker compose up -d
+python -m pytest -q -m e2e
+# в CI: CRAWL4AI_E2E_WAIT_S=240 pytest -m e2e
+```
+
+Более безопасный запуск (обязательный API-ключ):
+
+```powershell
+$env:API_KEY = "my-secret-key-2026"
+docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build
 ```
 
 ## Настройки

@@ -1,0 +1,76 @@
+name: parsing_url
+
+on:
+  push:
+    paths:
+      - "services/parsing_url/**"
+      - ".github/workflows/parsing-url.yml"
+  pull_request:
+    paths:
+      - "services/parsing_url/**"
+      - ".github/workflows/parsing-url.yml"
+  workflow_dispatch:
+
+defaults:
+  run:
+    working-directory: services/parsing_url
+
+jobs:
+  unit:
+    name: Unit / API tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build service image
+        run: docker compose build
+
+      - name: Run pytest (skip live e2e)
+        run: >
+          docker run --rm
+          -v "$PWD:/app"
+          -w /app
+          -e ALLOW_INSECURE=true
+          -e ALLOW_PRIVATE_URLS=false
+          -e API_KEY=
+          -e LOG_LEVEL=WARNING
+          -e HOME=/home/app
+          -e PATH=/home/app/.local/bin:/usr/local/bin:/usr/bin:/bin
+          crawl4ai-service:latest
+          sh -c "pip install -q --user pytest pytest-asyncio httpx
+          && python -m pytest -q -m 'not e2e'"
+
+  e2e:
+    name: Live Docker smoke
+    runs-on: ubuntu-latest
+    needs: unit
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build and start service
+        run: docker compose up -d --build
+
+      - name: Wait for healthy + run e2e
+        env:
+          CRAWL4AI_BASE_URL: http://127.0.0.1:8000
+          CRAWL4AI_E2E_WAIT_S: "240"
+        run: >
+          docker run --rm --network host
+          -v "$PWD:/app"
+          -w /app
+          -e ALLOW_INSECURE=true
+          -e CRAWL4AI_BASE_URL
+          -e CRAWL4AI_E2E_WAIT_S
+          -e HOME=/home/app
+          -e PATH=/home/app/.local/bin:/usr/local/bin:/usr/bin:/bin
+          crawl4ai-service:latest
+          sh -c "pip install -q --user pytest pytest-asyncio httpx
+          && python -m pytest -q -m e2e"
+
+      - name: Dump logs on failure
+        if: failure()
+        run: docker compose logs --tail 200 crawl4ai-api
+
+      - name: Stop
+        if: always()
+        run: docker compose down -v

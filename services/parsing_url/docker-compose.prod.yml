@@ -1,0 +1,9 @@
+# Safer overlay: require API_KEY and disable open /parse.
+# Usage:
+#   set API_KEY=your-secret
+#   docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build
+services:
+  crawl4ai-api:
+    environment:
+      ALLOW_INSECURE: "false"
+      API_KEY: "${API_KEY:?Set API_KEY before using docker-compose.prod.yml}"
