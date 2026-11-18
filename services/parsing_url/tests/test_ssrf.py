@@ -53,3 +53,34 @@ async def test_resolve_failure(monkeypatch):
     monkeypatch.setattr(asyncio.get_running_loop(), "getaddrinfo", boom)
     with pytest.raises(BlockedURLError, match="Cannot resolve"):
         await ensure_public_url("http://no-such-host.invalid/")
+
+
+@pytest.mark.asyncio
+async def test_negative_cache_skips_dns_but_public_not_cached(monkeypatch):
+    calls = {"n": 0}
+
+    async def private_then_unused(host, port, *args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return [_addr("127.0.0.1", 80)]
+        return [_addr("93.184.216.34", 80)]
+
+    monkeypatch.setattr(asyncio.get_running_loop(), "getaddrinfo", private_then_unused)
+    with pytest.raises(BlockedURLError, match="non-public"):
+        await ensure_public_url("http://evil.test/")
+    # Second call must use negative cache (no extra DNS).
+    with pytest.raises(BlockedURLError, match="non-public"):
+        await ensure_public_url("http://evil.test/")
+    assert calls["n"] == 1
+
+    # Public hosts must be re-resolved every time (no positive cache / rebinding).
+    calls["n"] = 0
+
+    async def public_ip(host, port, *args, **kwargs):
+        calls["n"] += 1
+        return [_addr("93.184.216.34", 80)]
+
+    monkeypatch.setattr(asyncio.get_running_loop(), "getaddrinfo", public_ip)
+    await ensure_public_url("https://example.com/")
+    await ensure_public_url("https://example.com/")
+    assert calls["n"] == 2

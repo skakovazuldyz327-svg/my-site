@@ -13,9 +13,9 @@ from app import main as app_main
 
 @pytest.fixture(autouse=True)
 def _clear_ssrf_cache():
-    app_main._host_public_cache.clear()
+    app_main._host_block_until.clear()
     yield
-    app_main._host_public_cache.clear()
+    app_main._host_block_until.clear()
 
 
 @pytest.fixture

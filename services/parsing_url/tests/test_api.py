@@ -26,6 +26,12 @@ def test_health_ready(client):
     assert response.json() == {"status": "ok", "browser": "ready"}
 
 
+def test_health_error_status(client):
+    app_main.crawler_holder.state = "error"
+    response = client.get("/health")
+    assert response.json() == {"status": "error", "browser": "error"}
+
+
 @pytest.mark.parametrize(
     "payload",
     [

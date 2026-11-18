@@ -85,7 +85,7 @@ class CrawlerHolder:
                 crawler = AsyncWebCrawler(config=BrowserConfig(headless=True, verbose=False))
                 try:
                     await crawler.start()
-                    # Abort navigations/subresources to private/loopback hosts before they load.
+                    # Abort private/loopback navigations and redirects before they load.
                     crawler.crawler_strategy.set_hook(
                         "on_page_context_created", _install_ssrf_route_guard
                     )
@@ -129,8 +129,10 @@ class CrawlerHolder:
 crawler_holder = CrawlerHolder()
 semaphore = asyncio.Semaphore(MAX_CONCURRENCY)
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
-# hostname -> True if all resolved addresses are public
-_host_public_cache: dict[str, bool] = {}
+# Negative-only cache: remember blocked hosts briefly. Never cache "public" —
+# a positive cache would widen the DNS-rebinding window.
+_HOST_BLOCK_TTL_S = 60.0
+_host_block_until: dict[str, float] = {}
 
 
 def require_api_key(key: Optional[str] = Security(api_key_header)) -> None:
@@ -139,6 +141,20 @@ def require_api_key(key: Optional[str] = Security(api_key_header)) -> None:
         key and secrets.compare_digest(key.encode("latin-1", "replace"), API_KEY.encode("utf-8"))
     ):
         raise HTTPException(status_code=401, detail="Invalid or missing X-API-Key")
+
+
+def _remember_blocked_host(host: str) -> None:
+    _host_block_until[host] = asyncio.get_running_loop().time() + _HOST_BLOCK_TTL_S
+
+
+def _is_recently_blocked(host: str) -> bool:
+    until = _host_block_until.get(host)
+    if until is None:
+        return False
+    if asyncio.get_running_loop().time() >= until:
+        _host_block_until.pop(host, None)
+        return False
+    return True
 
 
 async def ensure_public_url(url: str) -> None:
@@ -154,10 +170,7 @@ async def ensure_public_url(url: str) -> None:
         raise BlockedURLError("URL has no hostname")
     port = parts.port or (443 if scheme == "https" else 80)
 
-    cached = _host_public_cache.get(host)
-    if cached is True:
-        return
-    if cached is False:
+    if _is_recently_blocked(host):
         raise BlockedURLError(f"URL host '{host}' resolves to a non-public address")
 
     try:
@@ -170,9 +183,8 @@ async def ensure_public_url(url: str) -> None:
         if getattr(ip, "ipv4_mapped", None):
             ip = ip.ipv4_mapped
         if not ip.is_global:
-            _host_public_cache[host] = False
+            _remember_blocked_host(host)
             raise BlockedURLError(f"URL host '{host}' resolves to a non-public address ({ip})")
-    _host_public_cache[host] = True
 
 
 async def _install_ssrf_route_guard(page, context=None, **kwargs):
@@ -270,10 +282,13 @@ async def index() -> FileResponse:
 @app.get("/health")
 async def health():
     browser = crawler_holder.state
-    return {
-        "status": "ok" if browser == "ready" else "starting",
-        "browser": browser,
-    }
+    if browser == "ready":
+        status = "ok"
+    elif browser == "error":
+        status = "error"
+    else:
+        status = "starting"
+    return {"status": status, "browser": browser}
 
 
 async def _crawl(url: str, run_config: CrawlerRunConfig):
